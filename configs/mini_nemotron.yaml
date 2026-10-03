@@ -1,0 +1,13 @@
+# mini-swe-agent config for the local Nemotron server (src/server.py).
+# Text-based actions are used because the server does not implement native
+# tool calling. Pick the decoding mode through model.model_name:
+#   openai/nemotron-ar   or   openai/nemotron-dlm
+model:
+  model_class: litellm_textbased
+  model_name: openai/nemotron-ar
+  cost_tracking: ignore_errors
+  model_kwargs:
+    api_base: http://127.0.0.1:8011/v1
+    api_key: dummy
+    max_tokens: 1024
+    drop_params: true

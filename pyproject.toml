@@ -1,0 +1,51 @@
+[project]
+name = "src"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=1.15.0",
+    "fastapi>=0.142.2",
+    "mini-swe-agent>=2.4.6",
+    "nvitop>=1.7.1",
+    "torch>=2.6,<2.7",
+    "transformers>=5.0",
+    "uvicorn>=0.54.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[dependency-groups]
+dev = [
+    "pyink>=26.5.1",
+    "ruff>=0.16.10",
+    "ty>=0.0.84",
+]
+
+[tool.pyink]
+pyink = true
+line-length = 80
+pyink-indentation = 4
+pyink-use-majority-quotes = true
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 80
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "D", "UP", "B"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+force-single-line = false
+known-first-party = ["src"]
