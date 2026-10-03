@@ -1,0 +1,4 @@
+# Linear self-speculation: diffusion draft + causal verify (no LoRA),
+# matching the HF reference `model.linear_spec_generate(block_length=32)`.
+algorithm: LinearSpec
+causal_context: true

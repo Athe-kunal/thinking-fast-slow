@@ -1,0 +1,4 @@
+# Pure AR. The model is loaded with `ar_mode: true` (all layers causal); the
+# scheduler still needs a DLLM algorithm, as in NVIDIA's launch_server.sh.
+algorithm: FastDiffuser
+causal_context: true

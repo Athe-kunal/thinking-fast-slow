@@ -220,3 +220,5 @@ __marimo__/
 .claude
 
 runs
+third_party/
+.venv-sglang/

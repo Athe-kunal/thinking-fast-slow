@@ -54,3 +54,32 @@ uv run python -m src.harbor_runner tasks/hello-world tasks/sum-numbers --mode ar
 
 Each task is run with mini-swe-agent (on the host) against the server. Then the
 task's `tests/test.sh` runs in the same container and its reward is read.
+
+## SGLang serving (NVIDIA DLLM fork)
+
+NVIDIA's fast inference path is an SGLang fork (`hutm/sglang`); the upstream
+PR, sgl-project/sglang#25803, is not merged. `scripts/setup_sglang.sh` clones
+it at a pinned commit into `third_party/sglang` and builds a separate
+`.venv-sglang`, swapping the fork's CUDA 13 pins for CUDA 12.x builds that run
+on driver 550 (`configs/sglang/overrides.txt`).
+
+```bash
+scripts/setup_sglang.sh
+scripts/launch_sglang.sh linear_spec        # or: dlm | ar   (PORT=30000)
+uv run python -m scripts.compare_sglang --mode linear_spec   # vs HF reference
+```
+
+One decoding mode per server (chosen at launch). Measured on one A100
+(3B, 30 GSM8K questions, greedy, concurrency 1):
+
+| mode | SGLang acc. | HF acc. | identical outputs | SGLang tok/s | HF tok/s |
+|---|---|---|---|---|---|
+| linear_spec | 86.7% | 86.7% | 19/30 | 450 | 187 |
+| dlm (FastDiffuser, threshold 0.9) | 83.3% | 86.7% | 8/30 | 291 | 116 |
+| ar (`ar_mode` + FastDiffuser) | **36.7%** | 86.7% | 0/30 | 109 | 51 |
+
+SGLang's `ar` mode is not the model's real AR path and loses accuracy; use
+`linear_spec` (lossless AR-verified) or the HF engine for AR.
+
+`scripts/check_switch.py` verifies that AR <-> diffusion switching can be
+driven by the causal hidden state (see that file's docstring).

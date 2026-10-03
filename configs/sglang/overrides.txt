@@ -1,0 +1,9 @@
+# The fork pins CUDA 13 builds, which need NVIDIA driver >= 580. These pins
+# swap in CUDA 12.x builds that run on driver 550 (CUDA 12.4) through CUDA
+# minor-version compatibility. sglang-kernel is installed separately from
+# the cu129 wheel index (see scripts/setup_sglang.sh).
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+torchvision==0.26.0+cu128
+flashinfer_python[cu12]==0.6.14
+cuda-python==12.9.4

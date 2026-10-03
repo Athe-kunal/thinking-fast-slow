@@ -1,0 +1,5 @@
+# Block diffusion, matching the HF reference `model.generate(block_length=32,
+# threshold=0.9)` used by src/engine.py's "dlm" mode.
+algorithm: FastDiffuser
+causal_context: true
+threshold: 0.9
