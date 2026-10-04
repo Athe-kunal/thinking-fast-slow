@@ -19,6 +19,9 @@ import torch
 from src import router as router_lib
 from src.nemotron import modeling_nemotron_labs_diffusion as modeling
 
+# Prompt tokens per prefill forward pass.
+PREFILL_CHUNK = 8192
+
 
 @dataclasses.dataclass
 class Segment:
@@ -88,11 +91,21 @@ def interleaved_generate(
         lambda _m, _i, o: captured.update(h=o.last_hidden_state[0, -1])
     )
 
-    # Causal prefill: builds the cache and the first next-token logits.
+    # Causal prefill: builds the cache and the first next-token logits. Long
+    # prompts are prefilled in chunks so activation memory stays bounded
+    # (exact for causal attention over the cache), and only the last position
+    # goes through the LM head (full-prompt logits cost prompt_len x vocab).
     _set_causal(model, True)
-    out = model(prompt_ids, use_cache=True, use_causal_mask=True)
-    cache = out.past_key_values
-    next_logit = out.logits[:, -1, :]
+    cache = None
+    for start in range(0, prompt_ids.shape[1], PREFILL_CHUNK):
+        enc = model.encoder(
+            input_ids=prompt_ids[:, start : start + PREFILL_CHUNK],
+            past_key_values=cache,
+            use_cache=True,
+            use_causal_mask=True,
+        )
+        cache = enc.past_key_values
+    next_logit = model.diffusion_head(enc.last_hidden_state[:, -1, :])
     nfe = 1
 
     tokens: list[int] = []

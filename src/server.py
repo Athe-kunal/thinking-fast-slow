@@ -12,6 +12,8 @@ The model is loaded once; the decoding mode is chosen per request through the
 """
 
 import argparse
+import json
+import pathlib
 import threading
 import time
 import uuid
@@ -19,6 +21,7 @@ from typing import Any
 
 import fastapi
 import pydantic
+import torch
 import uvicorn
 
 from src import engine as engine_lib
@@ -61,13 +64,17 @@ def _mode_from_model(model: str, default: engine_lib.Mode) -> engine_lib.Mode:
 
 
 def create_app(
-    engine: engine_lib.NemotronEngine, max_new_tokens: int
+    engine: engine_lib.NemotronEngine,
+    max_new_tokens: int,
+    log_path: pathlib.Path | None = None,
 ) -> fastapi.FastAPI:
     """Builds the FastAPI app.
 
     Args:
         engine: Loaded engine shared by all requests.
         max_new_tokens: Default generation budget when a request has none.
+        log_path: If set, one JSON line per request is appended here (mode,
+            token counts, NFE, timing and the routing trace).
 
     Returns:
         The FastAPI application.
@@ -106,6 +113,18 @@ def create_app(
         with lock:
             result = engine.generate(messages, mode=mode, **kwargs)
         prompt_tokens = engine.encode_chat(messages).shape[1]
+        if log_path is not None:
+            record = {
+                "time": time.time(),
+                "mode": mode,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": result.num_tokens,
+                "nfe": result.nfe,
+                "seconds": result.seconds,
+                "segments": result.segments,
+            }
+            with lock, log_path.open("a") as f:
+                f.write(json.dumps(record) + "\n")
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -143,24 +162,37 @@ def main() -> None:
         "--router", default="entropy", choices=router_lib.ROUTERS
     )
     parser.add_argument("--entropy-threshold", type=float, default=0.5)
+    parser.add_argument("--p-dlm", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--ar-chunk", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--log-file", type=pathlib.Path, default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=DTYPES)
+    parser.add_argument(
+        "--gpu-memory-fraction",
+        type=float,
+        default=None,
+        help="Cap this process's share of GPU memory (several servers/GPU).",
+    )
     args = parser.parse_args()
+    if args.gpu_memory_fraction is not None:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
 
     engine = engine_lib.NemotronEngine(
         args.model,
         device=args.device,
         dtype=DTYPES[args.dtype],
         mode=args.mode,
-        router=router_lib.make_router(args.router, args.entropy_threshold),
+        router=router_lib.make_router(
+            args.router, args.entropy_threshold, args.p_dlm, args.seed
+        ),
         ar_chunk=args.ar_chunk,
     )
     uvicorn.run(
-        create_app(engine, args.max_new_tokens),
+        create_app(engine, args.max_new_tokens, args.log_file),
         host=args.host,
         port=args.port,
     )

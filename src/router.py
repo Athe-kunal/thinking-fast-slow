@@ -6,6 +6,7 @@ at every decision point, i.e. after each AR chunk or diffusion block.
 
 import dataclasses
 import itertools
+import random
 from typing import Literal, Protocol
 
 import torch
@@ -96,15 +97,46 @@ class EntropyRouter:
         return "dlm" if entropy < self.threshold else "ar"
 
 
-ROUTERS = ("entropy", "cycle")
+class RandomRouter:
+    """Untrained baseline: picks diffusion with a fixed probability.
+
+    Attributes:
+        p_dlm: Probability of choosing "dlm" at each decision.
+    """
+
+    def __init__(self, p_dlm: float, seed: int | None = None) -> None:
+        """Initializes the router.
+
+        Args:
+            p_dlm: Probability of choosing "dlm" at each decision.
+            seed: Seed for the router's own RNG; None for nondeterministic.
+        """
+        if not 0.0 <= p_dlm <= 1.0:
+            raise ValueError(f"p_dlm must be in [0, 1], got {p_dlm}.")
+        self.p_dlm = p_dlm
+        self._rng = random.Random(seed)
+
+    def __call__(self, state: RouterState) -> Mode:
+        """Returns "dlm" with probability `p_dlm`, else "ar"."""
+        return "dlm" if self._rng.random() < self.p_dlm else "ar"
 
 
-def make_router(name: str, entropy_threshold: float = 0.5) -> Router:
+ROUTERS = ("entropy", "cycle", "random")
+
+
+def make_router(
+    name: str,
+    entropy_threshold: float = 0.5,
+    p_dlm: float = 0.5,
+    seed: int | None = None,
+) -> Router:
     """Builds a router by name.
 
     Args:
         name: One of `ROUTERS`.
         entropy_threshold: Threshold for the entropy router.
+        p_dlm: Diffusion probability for the random router.
+        seed: Seed for the random router.
 
     Returns:
         The router.
@@ -116,4 +148,6 @@ def make_router(name: str, entropy_threshold: float = 0.5) -> Router:
         return EntropyRouter(entropy_threshold)
     if name == "cycle":
         return CycleRouter()
+    if name == "random":
+        return RandomRouter(p_dlm, seed)
     raise ValueError(f"Unknown router {name!r}; choose from {ROUTERS}.")

@@ -222,3 +222,4 @@ __marimo__/
 runs
 third_party/
 .venv-sglang/
+.venv-swebench/
