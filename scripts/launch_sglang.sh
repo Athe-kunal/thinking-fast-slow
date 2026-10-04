@@ -9,8 +9,10 @@
 # One mode per server: SGLang picks the decoding algorithm at launch.
 # Env overrides: MODEL, PORT, MEM_FRAC, MAX_REQS, CTX_LEN, ATTN_BACKEND.
 # Routed mode: POLICY_MODE (sample | greedy | fixed_ar | fixed_dlm |
-# random:<p>), AR_CHUNK, TRACE_DIR, ROUTER_CKPT. It runs eagerly (no CUDA
-# graphs) because the algorithm reads each forward's hidden states.
+# random:<p>), AR_CHUNK, FORCED_AR_TOKENS, BLOCK_SIZE, THRESHOLD, TRACE_DIR,
+# ROUTER_CKPT.
+# It runs eagerly (no CUDA graphs) because the algorithm reads each forward's
+# hidden states.
 # Set up the environment first with scripts/setup_sglang.sh.
 set -euo pipefail
 
@@ -47,8 +49,10 @@ case "${mode}" in
       echo "algorithm: RoutedDecoding"
       echo "causal_context: true"
       echo "first_done_first_out_mode: false"
-      echo "threshold: 0.9"
+      echo "threshold: ${THRESHOLD:-0.9}"
       echo "ar_chunk: ${AR_CHUNK:-8}"
+      echo "forced_ar_tokens: ${FORCED_AR_TOKENS:-0}"
+      echo "block_size: ${BLOCK_SIZE:-32}"
       echo "policy_mode: \"${POLICY_MODE:-sample}\""
       if [[ -n "${TRACE_DIR:-}" ]]; then echo "trace_dir: \"${TRACE_DIR}\""; fi
       if [[ -n "${ROUTER_CKPT:-}" ]]; then

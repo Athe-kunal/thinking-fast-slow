@@ -14,10 +14,10 @@ index 3d9a15552..f086211f2 100644
              return {"page_size": 1}
 diff --git a/python/sglang/srt/dllm/algorithm/routed.py b/python/sglang/srt/dllm/algorithm/routed.py
 new file mode 100644
-index 000000000..bed85ec34
+index 000000000..50eca3874
 --- /dev/null
 +++ b/python/sglang/srt/dllm/algorithm/routed.py
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,318 @@
 +"""Routed decoding: a learned router picks AR or block diffusion per segment.
 +
 +Mirrors the HF reference decoder in thinking-fast-slow's `src/interleave.py`:
@@ -55,7 +55,7 @@ index 000000000..bed85ec34
 +
 +from sglang.srt.dllm.algorithm.fastdiffuser import FastDiffuser
 +from sglang.srt.dllm.config import DllmConfig
-+from sglang.srt.dllm.router_policy import ACTION_DLM, RouterPolicy
++from sglang.srt.dllm.router_policy import ACTION_AR, ACTION_DLM, RouterPolicy
 +from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 +from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 +from sglang.srt.model_executor.model_runner import ModelRunner
@@ -85,6 +85,9 @@ index 000000000..bed85ec34
 +        super().__init__(config)
 +        cfg = config.algorithm_config
 +        self.ar_chunk: int = int(cfg.get("ar_chunk", 8))
++        # The first `forced_ar_tokens` generated tokens are always AR; the
++        # router is not consulted (and nothing is traced) until then.
++        self.forced_ar_tokens: int = int(cfg.get("forced_ar_tokens", 0))
 +        self.policy_mode: str = cfg.get("policy_mode", "sample")
 +        self.trace_dir: Optional[str] = cfg.get("trace_dir")
 +        self.router_checkpoint: Optional[str] = cfg.get("router_checkpoint")
@@ -95,10 +98,11 @@ index 000000000..bed85ec34
 +        if self.trace_dir:
 +            os.makedirs(self.trace_dir, exist_ok=True)
 +        logger.info(
-+            "RoutedDecoding: block_size=%d ar_chunk=%d threshold=%s "
-+            "policy_mode=%s trace_dir=%s",
++            "RoutedDecoding: block_size=%d ar_chunk=%d forced_ar_tokens=%d "
++            "threshold=%s policy_mode=%s trace_dir=%s",
 +            self.block_size,
 +            self.ar_chunk,
++            self.forced_ar_tokens,
 +            self.threshold,
 +            self.policy_mode,
 +            self.trace_dir,
@@ -179,7 +183,16 @@ index 000000000..bed85ec34
 +    # ------------------------------------------------------------- decide
 +    def _decide(self, *, rids: List[str]) -> None:
 +        """Runs the router for requests at a decision point."""
-+        need = [r for r in rids if self._states[r].mode is None]
++        need = []
++        for r in rids:
++            s = self._states[r]
++            if s.mode is not None:
++                continue
++            if s.num_generated < self.forced_ar_tokens:
++                s.mode = ACTION_AR
++                s.ar_left = min(self.ar_chunk, self.forced_ar_tokens - s.num_generated)
++            else:
++                need.append(r)
 +        if not need:
 +            return
 +        states = [self._states[r] for r in need]

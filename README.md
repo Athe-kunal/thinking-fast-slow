@@ -83,3 +83,14 @@ SGLang's `ar` mode is not the model's real AR path and loses accuracy; use
 
 `scripts/check_switch.py` verifies that AR <-> diffusion switching can be
 driven by the causal hidden state (see that file's docstring).
+
+## Running experiments (config-driven)
+
+Experiments are YAML files in `configs/experiments/` (see its README for the
+schema): decoding granularity, RL hyperparameters, data mix, evaluated routers
+and sweeps. No code changes are needed for a new experiment.
+
+```bash
+uv run python -m scripts.run_experiments configs/experiments/e15_blk4_ar1.yaml --gpus 0 1 2 3
+uv run python -m scripts.summarize_experiments --reference baselines:random:0.0
+```

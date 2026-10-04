@@ -82,6 +82,9 @@ class Server:
             "PORT": str(self.port),
             "POLICY_MODE": "sample",
             "AR_CHUNK": str(args.ar_chunk),
+            "FORCED_AR_TOKENS": str(args.forced_ar_tokens),
+            "BLOCK_SIZE": str(args.block_size),
+            "THRESHOLD": str(args.threshold),
             "TRACE_DIR": str(self.trace_dir),
             "MAX_REQS": str(args.max_reqs),
             "MEM_FRAC": str(args.mem_frac),
@@ -403,6 +406,22 @@ def main() -> None:
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--ar-chunk", type=int, default=8)
+    parser.add_argument(
+        "--block-size", type=int, default=32, help="diffusion block length"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.9,
+        help="diffusion unmasking confidence threshold",
+    )
+    parser.add_argument(
+        "--forced-ar-tokens",
+        type=int,
+        default=0,
+        help="Always decode the first N tokens with AR; the router learns "
+        "only the decisions after that.",
+    )
     parser.add_argument("--cost-weight", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=2)

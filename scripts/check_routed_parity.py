@@ -2,7 +2,7 @@
 
 Sends prompts to a running routed server (`scripts/launch_sglang.sh routed`)
 and compares token-for-token with HF: POLICY_MODE=fixed_ar vs `ar_generate`,
-POLICY_MODE=fixed_dlm vs `generate(block 32, threshold 0.9)`.
+POLICY_MODE=fixed_dlm vs `generate(block_length, threshold 0.9)`.
 
     CUDA_VISIBLE_DEVICES=3 uv run python -m scripts.check_routed_parity \
         --mode fixed_ar --port 30021 -n 10
@@ -43,6 +43,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=30021)
     parser.add_argument("-n", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument(
+        "--block-length", type=int, default=32, help="must match BLOCK_SIZE"
+    )
     args = parser.parse_args()
 
     engine = engine_lib.NemotronEngine()
@@ -62,7 +65,7 @@ def main() -> None:
             out, _ = model.generate(
                 ids,
                 max_new_tokens=args.max_tokens,
-                block_length=32,
+                block_length=args.block_length,
                 threshold=0.9,
                 eos_token_id=eos,
             )

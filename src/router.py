@@ -178,6 +178,31 @@ class LearnedRouter:
         return "dlm" if action == router_policy.ACTION_DLM else "ar"
 
 
+class ForcedARStart:
+    """Always routes to AR until `n_tokens` have been generated.
+
+    Wraps another router; the wrapped router is not called (and so records
+    nothing) during the forced AR start. Mirrors `forced_ar_tokens` in the
+    SGLang RoutedDecoding algorithm.
+    """
+
+    def __init__(self, router: Router, n_tokens: int) -> None:
+        """Initializes the wrapper.
+
+        Args:
+            router: Router used once the forced AR start is over.
+            n_tokens: Number of tokens always decoded with AR.
+        """
+        self.router = router
+        self.n_tokens = n_tokens
+
+    def __call__(self, state: RouterState) -> Mode:
+        """Returns "ar" during the forced start, else the router's choice."""
+        if state.num_generated < self.n_tokens:
+            return "ar"
+        return self.router(state)
+
+
 ROUTERS = ("entropy", "cycle", "random")
 
 

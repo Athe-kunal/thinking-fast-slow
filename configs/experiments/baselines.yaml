@@ -1,0 +1,4 @@
+# No-RL reference routers at the default granularity (block 32, AR chunk 8).
+train: null
+eval:
+  routers: [random:0.0, random:1.0, random:0.5, entropy:0.5]

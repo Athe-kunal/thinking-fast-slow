@@ -5,6 +5,8 @@ found. Newest experiment last within "Experiments". Every number here comes
 from a run artifact under `runs/` (git-ignored, local to the machine) or from a
 cited source; anything not verified is marked as such.
 
+**How experiments are run (from E16 on):** each experiment is a YAML file in `configs/experiments/` run by `scripts/run_experiments.py` (outputs in `runs/experiments/<run>/`, resolved config saved with results); `scripts/summarize_experiments.py` tabulates results with paired tests. E13-E15 were launched by hand before the runner existed; their configs are recorded in `configs/experiments/e13_*`, `e14_*`, `e15_*`.
+
 **Maintenance rule:** every new experiment gets an entry (question, setup,
 assumptions, results, conclusion, artifacts) and any new global assumption goes
 into the assumption register.
@@ -282,9 +284,30 @@ outcome + compute cost, possibly with a supervised warm start), backbone frozen.
 - **Conclusion:** run2's router did not learn routing (weights barely moved; random-direction controls reproduce its behaviour; it50 vs it100 differ only in the first-decision constant). Its favourable HumanEval numbers come from always choosing AR first. Not significant vs comparable routers. Untested candidate rule suggested by this: AR for the first segment, then diffusion (or entropy routing) afterwards.
 - **RL takeaways:** std-normalized GRPO collapses to diffusion (E11); unnormalized advantages with entropy 0.05 does not move the policy at all (E12). Next attempts need a weaker entropy bonus (e.g. 0.01-0.02) or per-decision credit (e.g. reward-to-go / position-aware baselines), and evaluation should report first-decision behaviour separately.
 
+### E13. Router RL with a forced AR start (2026-10-04, running)
+
+- **Question:** E12 showed the first segment's mode sets answer style and acts as a constant for a deterministic router. If the first 8 tokens are always AR, can RL learn the remaining AR/diffusion switching?
+- **Setup:** `runs/router_rl/run3_forcedar8`; as E12 (unnormalized advantages, 100 iterations x 32 prompts x 8 rollouts, 512 tokens, AR segment 8, diffusion block 32 / thr 0.9, cost weight 0.1, lr 3e-4, same data mix) except: `--forced-ar-tokens 8` (RoutedDecoding `forced_ar_tokens`: the router is not consulted and nothing is traced until 8 tokens are generated) and entropy bonus 0.01. Includes the code-review fixes. Eval: `learned:<ckpt>@ar8@first8` (HF `ForcedARStart` wrapper) on GSM8K test + HumanEval.
+- **Verified:** server trace for a forced-start request: 8 AR calls of 1 token, no decision record, first decision at token 8.
+- **Results:** pending.
+
+### E14. Entropy-bonus grid for router RL (2026-10-04, queued after E13)
+
+- **Question:** E11 (0.01 + std-normalized advantages) collapsed to diffusion; E12 (0.05, unnormalized) never moved. Where between does unnormalized-advantage RL learn?
+- **Setup:** three runs `runs/router_rl/grid_ent{0.005,0.01,0.02}`, identical to E12 (no forced AR start, unnormalized advantages) except the entropy bonus. Eval: `learned:<ckpt>@ar8`. `grid_ent0.01` differs from E13 only by the forced AR start.
+- **Results:** pending.
+
+### E15. Fine-grained routing: diffusion block 4, decision after every AR token (2026-10-04, running on GPUs 0+1)
+
+- **Question:** E8/E9 found the costly mistakes happen inside long (32-token) diffusion blocks. With 4-token diffusion blocks and a router decision after every AR token, does a learned router get the control it needs?
+- **Setup:** (1) no-RL baselines at this granularity on GSM8K test + HumanEval: `random:1.0@ar1@blk4` (pure diffusion, block 4), `random:0.5@ar1@blk4`, `entropy:0.5@ar1@blk4` (pure AR is block-independent: reuse E5); (2) RL `runs/router_rl/run4_blk4_ar1`: as E12/E13 (unnormalized advantages, 100 x 32 x 8, 512 tokens, cost weight 0.1, lr 3e-4, same data) with `--block-size 4 --ar-chunk 1`, entropy bonus 0.01, no forced AR start; (3) eval `learned:<ckpt>@ar1@blk4`. Eval records in `runs/router_bench_e15/` (separate dir: the E13/E14 queue writes `runs/router_bench/` concurrently).
+- **New plumbing:** `@blk<n>` setting suffix (per-setting diffusion block length), `BLOCK_SIZE` for routed SGLang servers, trainer `--block-size`.
+- **SGLang parity at block 4 (GSM8K 5 + HumanEval 5, 256 tokens):** `fixed_dlm` vs HF `generate(block 4, thr 0.9)` identical 5/10 (others share 19-146 tokens); `fixed_ar` vs `ar_generate` identical 8/10.
+- **Results:** pending.
+
 ### Fixes after code review (2026-10-04)
 
-Applied before any further router training; E11/E12 ran without them.
+Applied before any further router training (E13 onward); E11/E12 ran without them.
 1. **Per-request router state no longer held on the GPU.** RoutedDecoding kept each request's boundary hidden state and full-vocabulary logits (~0.5 MB) on the GPU and only freed them on EOS; requests ending at the length limit or aborted leaked until a 20k-entry LRU cap. State now holds only the router features (hidden on CPU in float32, entropy, top-1; ~12 KB). No GPU memory growth was seen in E12 (66.7/67.1 GB at iteration 8, about the start level), so E11/E12 were not affected in practice.
 2. **Cost denominator uses the tokens actually returned.** The trace counts whole committed diffusion blocks, but the scheduler truncates the last block at `max_new_tokens`; the trainer now uses the server's `completion_tokens` (forward passes still counted as spent). E11/E12 slightly underestimated diffusion's cost on truncated rollouts (a small extra pull toward diffusion).
 3. **Resume safety.** Request ids carry a per-process run tag and stale trace files are deleted before sending, so a resumed run never mixes in traces from a crashed attempt.

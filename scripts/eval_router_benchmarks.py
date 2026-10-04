@@ -4,10 +4,12 @@ A setting names a router: `random:<p>` routes each 32-token segment to
 diffusion with probability p (AR segments are also 32 tokens, so p is the
 expected diffusion token share; p=0 is pure AR, p=1 pure diffusion), and
 `entropy:<nats>` uses diffusion when the next-token entropy at the decision
-point is below the threshold. A suffix `@ar<n>` (e.g. `entropy:0.5@ar1`)
-sets the AR segment length, i.e. how many AR tokens are decoded before the
-router decides again (default `--ar-chunk`). `learned:<checkpoint>` runs a
-trained `RouterPolicy` with greedy decisions. Generation runs several worker
+point is below the threshold. A suffix `@ar<n>` (e.g. `entropy:0.5@ar1`) sets
+the AR segment length, i.e. how many AR tokens are decoded before the router
+decides again (default `--ar-chunk`); `@first<n>` forces AR for the first n
+generated tokens before the router is consulted, and `@blk<n>` sets the
+diffusion block length (default `--block-length`). `learned:<checkpoint>` runs
+a trained `RouterPolicy` with greedy decisions. Generation runs several worker
 processes per GPU; each loads the model once and takes every n-th item from a
 priority-ordered list (settings in the order given), appending results to its
 own JSONL file, so a rerun resumes where it stopped.
@@ -84,25 +86,47 @@ def setting_of(record: dict) -> str:
     return record.get("setting") or f"random:{record['p_dlm']}"
 
 
-def parse_setting(setting: str, default_ar_chunk: int) -> tuple[str, int]:
-    """Splits "entropy:0.5@ar1" into ("entropy:0.5", 1).
+def parse_setting(
+    setting: str, default_ar_chunk: int, default_block: int = 32
+) -> tuple[str, int, int, int]:
+    """Splits "learned:c.pt@ar1@blk4@first8" into ("learned:c.pt", 1, 8, 4).
 
-    The optional "@ar<n>" suffix sets the AR segment length (tokens decoded
-    before the router decides again); without it `default_ar_chunk` is used.
+    Optional suffixes: "@ar<n>" sets the AR segment length (tokens decoded
+    before the router decides again; default `default_ar_chunk`), "@first<n>"
+    forces AR for the first n generated tokens (default 0), "@blk<n>" sets
+    the diffusion block length (default `default_block`).
+
+    Returns:
+        (router spec, AR segment length, forced AR tokens, block length).
     """
-    router, _, suffix = setting.partition("@")
-    if not suffix:
-        return router, default_ar_chunk
-    if not suffix.startswith("ar"):
-        raise ValueError(f"unknown setting suffix {suffix!r}")
-    return router, int(suffix.removeprefix("ar"))
+    router, *suffixes = setting.split("@")
+    ar_chunk, forced, block = default_ar_chunk, 0, default_block
+    for suffix in suffixes:
+        if suffix.startswith("first"):
+            forced = int(suffix.removeprefix("first"))
+        elif suffix.startswith("blk"):
+            block = int(suffix.removeprefix("blk"))
+        elif suffix.startswith("ar"):
+            ar_chunk = int(suffix.removeprefix("ar"))
+        else:
+            raise ValueError(f"unknown setting suffix {suffix!r}")
+    return router, ar_chunk, forced, block
 
 
 def make_router(setting: str, bench: str, idx: int):  # noqa: ANN201
     """Builds the router for one item of one setting."""
     from src import router as router_lib  # noqa: PLC0415
 
-    kind, value = setting.partition("@")[0].split(":", 1)
+    spec, _, forced, _ = parse_setting(setting, 0)
+    router = _make_base_router(spec, bench, idx)
+    return router_lib.ForcedARStart(router, forced) if forced else router
+
+
+def _make_base_router(spec: str, bench: str, idx: int):  # noqa: ANN202
+    """Builds the router named by a spec without suffixes."""
+    from src import router as router_lib  # noqa: PLC0415
+
+    kind, value = spec.split(":", 1)
     if kind == "random":
         p = float(value)
         return router_lib.RandomRouter(p, item_seed(p, bench, idx))
@@ -110,7 +134,7 @@ def make_router(setting: str, bench: str, idx: int):  # noqa: ANN201
         return router_lib.EntropyRouter(float(value))
     if kind == "learned":
         return router_lib.LearnedRouter(load_policy(value), mode="greedy")
-    raise ValueError(f"unknown setting {setting!r}")
+    raise ValueError(f"unknown router spec {spec!r}")
 
 
 @functools.cache
@@ -158,12 +182,14 @@ def run_worker(args: argparse.Namespace) -> None:
     with out_path.open("a") as f:
         for setting, bench, item in todo:
             engine.router = make_router(setting, bench, item["id"])
-            engine.ar_chunk = parse_setting(setting, args.ar_chunk)[1]
+            _, engine.ar_chunk, _, block_length = parse_setting(
+                setting, args.ar_chunk, args.block_length
+            )
             result = engine.generate(
                 item["prompt"],
                 mode="mix",
                 max_new_tokens=args.max_tokens,
-                block_length=args.block_length,
+                block_length=block_length,
                 threshold=args.threshold,
             )
             record = {

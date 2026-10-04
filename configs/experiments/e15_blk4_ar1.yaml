@@ -1,0 +1,5 @@
+# E15: diffusion block 4, router decision after every AR token.
+decoding: {block_size: 4, ar_chunk: 1}
+train: {entropy_coef: 0.01}
+eval:
+  routers: [learned, random:1.0, random:0.5, entropy:0.5]
