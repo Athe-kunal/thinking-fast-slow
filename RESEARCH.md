@@ -242,6 +242,32 @@ outcome + compute cost, possibly with a supervised warm start), backbone frozen.
 - **Conclusion:** with boundary next-token entropy as the signal, the AR segment length mostly sets how much AR is forced, i.e. a crude knob on the diffusion share; it does not make the router smarter. Confirms E8: the useful decisions must be made inside diffusion blocks.
 - **Artifacts:** `runs/router_bench/` (`setting: "entropy:0.5@ar8"`).
 
+### E10. Learned-router infrastructure: SGLang RoutedDecoding verification (2026-10-03)
+
+- **What was built:** `src/router_policy.py` (RouterPolicy MLP on [hidden 3072, entropy, top1, last_dlm] -> p(diffusion), zero-init = p 0.5; same file copied into the fork); HF `LearnedRouter` + eval setting `learned:<ckpt>`; SGLang algorithm `RoutedDecoding` (`patches/sglang-routed.patch`): per-request routing at segment boundaries, AR = 1 token per call (8 per decision), diffusion = seeded 32-token block (threshold 0.9), one causal commit pass per call, router as model submodule `router.*`, per-request JSONL traces (features, action, logp, per-call tokens/NFE); `launch_sglang.sh routed` (POLICY_MODE, TRACE_DIR, ROUTER_CKPT; eager, page size 1).
+- **Bug found and fixed:** the fork forces KV page size = block size (32) for every DLLM algorithm except LinearSpec; partial-block commits then corrupt the page table, which made the commit pass non-causal from the second block on (pos-0 logits changed by up to 13 when later positions changed). Added RoutedDecoding to the page-size-1 override; causal check then exact (diff 0.0000) on every call.
+- **Parity vs HF (GSM8K 5 + HumanEval 5 prompts, 256 tokens, greedy):** `fixed_ar` vs `ar_generate` identical 7/10 (others share 45-123 tokens first); `fixed_dlm` vs `generate(32, 0.9)` identical 4/10 (others share 46-196 tokens). Divergences after long common prefixes = bf16 kernel near-ties (cf. E3: SGLang LinearSpec 19/30, FastDiffuser 8/30). Note the stock SGLang FastDiffuser does not seed blocks from the causal pass the way HF does; RoutedDecoding does.
+- **Router features:** same prompts on both sides, 24 matched decision points: hidden cosine 0.9993-1.0000, scalar features within 0.05; logp recomputed from traced fp16 features equals the server's logp exactly.
+- **Router-only weight sync:** `update_weights_from_tensor` with only the 4 `router.*` tensors (CPU tensors, `torch.multiprocessing` sharing strategy `file_system`; the default fd strategy fails with an auth error and crashes the scheduler). Verified: bias -8 pushed -> all decisions AR with logp -0.00034 = log(1 - sigmoid(-8)). Router checkpoints are router-only (~790k params, ~3 MB).
+- **Open:** accuracy-level parity on full benchmarks (with the final eval); one client stalled after a weight push (fresh process fine), to watch in the trainer.
+
+### E11. GRPO training of the learned router, run1 (2026-10-03)
+
+- **Question:** can RL on task outcome + compute cost teach the router (frozen backbone) to beat hand-made routers on the accuracy/efficiency trade-off?
+- **Setup:** `scripts/train_router_rl.py` (run with `.venv-sglang`), 2 SGLang RoutedDecoding servers (GPUs 2, 3, `policy_mode: sample`). 100 iterations x 32 prompts x 8 rollouts, 512-token budget, AR segment 8, diffusion block 32 / thr 0.9. Data mix gsm8k 0.35 / mbpp 0.15 / kodcode 0.5 (`scripts/rl_data.py`: GSM8K train 7,473; MBPP train+val 464; KodCode-V1 filtered sample 2,395 whose reference solutions pass our sandbox, 80% of 3,000). Reward = correct - 0.1 x forward_passes/tokens. GRPO group advantages, PPO clip 0.2, 2 epochs, entropy 0.01, Adam 3e-4. Router-only checkpoints every 10 iterations (`runs/router_rl/run1/router_iter*.pt`, 3.15 MB).
+- **Assumptions:** cost weight 0.1 makes a 1-point accuracy loss outweigh the whole AR-vs-diffusion efficiency gap (AR penalty 0.1 vs diffusion ~0.04); same decoding settings as E5-E9 except per-decision AR segment 8.
+- **Sanity checks before the run:** dry run (2 iterations) with 0 failed rollouts and on-policy logp match 6e-8 after a sync; synthetic PPO test (advantage = 1 iff action matches a feature rule) agreement 0.49 -> 0.88 over 600 iterations.
+- **Results (100 iterations, 0 failed rollouts, ~45-85 s/iteration):** the router **collapsed to always-diffusion**. Mean p(diffusion) 0.65 (it 0-9) -> 0.95 (10-19) -> 0.998 (30+); policy entropy 0.59 -> 0.006; diffusion token share 0.87 -> 1.00; tokens/forward 1.93 -> ~2.18. Training accuracy shows no trend (GSM8K 0.82-0.93, KodCode 0.45-0.62 per 10-iteration window, noisy across sampled prompts); reward rose only through the cost term.
+- **Held-out check (HumanEval, greedy decisions, @ar8):** router_iter0010 and router_iter0100 both = pure diffusion: 72.6% (CI 65.3-78.8), 100% diffusion share, 2.46 tokens/forward, identical to random:1.0; vs AR 7 vs 20, p=0.019.
+- **Diagnosis (inferred, not yet measured):** with a greedy backbone the G rollouts of a prompt differ only in routing; most groups are all-correct or all-wrong, so reward differences are just the cost term (~0.01-0.05). GRPO's per-group std normalization inflates these to ~unit advantages, so almost every update favours diffusion and the rare groups where routing changes correctness are outvoted; exploration dies within ~20 iterations.
+- **Correction from run2's logging (same data/settings):** groups where routing changes correctness are *not* rare: 22-47% of prompt groups in the first 5 iterations. Revised diagnosis: the remaining majority of groups differ only in cost, and std normalization gave each of them unit-size "more diffusion" advantages, while a correctness flip in a mixed group is credited to all ~15 decisions of the rollout (noisier per-decision signal). A large consistent weak signal outweighed a smaller noisy strong one.
+
+### E12. Router GRPO run2: unnormalized advantages + stronger entropy (2026-10-04, running)
+
+- **Changes vs E11 (only):** advantage = reward - group mean (`--adv-norm none`); entropy coefficient 0.01 -> 0.05 (equivalent to a pull toward p=0.5). New logs: `mixed_correct_group_frac`, `group_reward_std`.
+- **Early iterations (0-4):** mixed-correct groups 0.22-0.47; mean p(diffusion) 0.50 -> 0.46 (drifting toward AR, not collapsing to diffusion).
+- **Results:** pending.
+
 ## 6. Reference numbers and related work
 
 - **NVIDIA 3B table (paper, not reproduced by us except GSM8K):** AR avg 55.50 @ TPF 1.00; Diff. 52.90 @ 1.91; Linear SS 55.00 @ 4.36; Quad SS 55.80 @ 5.42. HumanEval AR 76.22 / Diff. 74.39 / Linear SS 75.00. Quad SS is not in the released code.

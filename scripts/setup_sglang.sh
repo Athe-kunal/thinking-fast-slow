@@ -24,6 +24,16 @@ fi
 git -C "${src}" fetch -q origin "${commit}" 2>/dev/null || true
 git -C "${src}" checkout -q "${commit}"
 
+# Routed decoding (learned AR/diffusion router): the policy module is shared
+# with src/ (single source of truth), the algorithm + model hooks are a patch.
+cp "${root}/src/router_policy.py" "${src}/python/sglang/srt/dllm/router_policy.py"
+patch="${root}/patches/sglang-routed.patch"
+if git -C "${src}" apply --reverse --check "${patch}" 2>/dev/null; then
+  echo "routed patch already applied"
+else
+  git -C "${src}" apply "${patch}"
+fi
+
 uv venv -q -p 3.12 "${venv}"
 VIRTUAL_ENV="${venv}" uv pip install -q -e "${src}/python" \
   --override "${root}/configs/sglang/overrides.txt" \

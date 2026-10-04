@@ -1,0 +1,348 @@
+diff --git a/python/sglang/srt/arg_groups/overrides.py b/python/sglang/srt/arg_groups/overrides.py
+index 3d9a15552..f086211f2 100644
+--- a/python/sglang/srt/arg_groups/overrides.py
++++ b/python/sglang/srt/arg_groups/overrides.py
+@@ -2138,7 +2138,8 @@ def _dllm_page_size(view: Any) -> dict:
+     # LinearSpec accepts partial blocks, so it addresses KV per position and
+     # needs page_size == 1; the generic block-size alignment below would
+     # otherwise round it up to the dllm block size and corrupt the page table.
+-    if view.dllm_algorithm in ("LinearSpec", "linear_spec"):
++    # RoutedDecoding commits partial blocks too (1 token per AR call).
++    if view.dllm_algorithm in ("LinearSpec", "linear_spec", "RoutedDecoding"):
+         if not view.disable_radix_cache and view.page_size != 1:
+             logger.info("Setting page size to 1 for LinearSpec partial acceptance")
+             return {"page_size": 1}
+diff --git a/python/sglang/srt/dllm/algorithm/routed.py b/python/sglang/srt/dllm/algorithm/routed.py
+new file mode 100644
+index 000000000..463f52195
+--- /dev/null
++++ b/python/sglang/srt/dllm/algorithm/routed.py
+@@ -0,0 +1,294 @@
++"""Routed decoding: a learned router picks AR or block diffusion per segment.
++
++Mirrors the HF reference decoder in thinking-fast-slow's `src/interleave.py`:
++
++- After the prompt prefill, each request has a seed token (argmax of the causal
++  next-token logits) and a boundary state (final hidden state + logits at the
++  last committed token).
++- At a decision point the `RouterPolicy` (model submodule `router`) picks AR
++  (decode `ar_chunk` tokens, one per call) or diffusion (one block: seed at
++  position 0, remaining positions denoised with confidence-threshold
++  unmasking over bidirectional passes).
++- Every call ends with one causal pass that persists the KV cache; AR requests
++  commit 1 token, diffusion requests commit the whole block (truncated after
++  EOS). The scheduler frees the KV of uncommitted positions.
++
++Per-request decisions (features, action, log-prob) and per-call costs are
++appended to `<trace_dir>/<rid>.jsonl` for RL training.
++"""
++
++import base64
++import collections
++import json
++import logging
++import os
++from typing import List, Optional
++
++import msgspec
++import numpy as np
++import torch
++
++from sglang.srt.dllm.algorithm.fastdiffuser import FastDiffuser
++from sglang.srt.dllm.config import DllmConfig
++from sglang.srt.dllm.router_policy import ACTION_DLM, RouterPolicy
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++from sglang.srt.model_executor.model_runner import ModelRunner
++
++logger = logging.getLogger(__name__)
++
++_MAX_TRACKED_REQUESTS = 20000
++
++
++class _ReqState(msgspec.Struct):
++    """Per-request routing state between scheduler calls."""
++
++    seed: int
++    hidden: torch.Tensor  # (hidden,) causal state at the last committed token
++    logits: torch.Tensor  # (vocab,) causal next-token logits there
++    last_dlm: bool = False
++    mode: Optional[int] = None  # action of the current segment, None = decide
++    ar_left: int = 0
++    num_generated: int = 0
++
++
++class RoutedDecoding(FastDiffuser):
++    """AR/diffusion routing with a learned per-segment policy."""
++
++    def __init__(self, config: DllmConfig) -> None:
++        super().__init__(config)
++        cfg = config.algorithm_config
++        self.ar_chunk: int = int(cfg.get("ar_chunk", 8))
++        self.policy_mode: str = cfg.get("policy_mode", "sample")
++        self.trace_dir: Optional[str] = cfg.get("trace_dir")
++        self.router_checkpoint: Optional[str] = cfg.get("router_checkpoint")
++        self._states: "collections.OrderedDict[str, _ReqState]" = (
++            collections.OrderedDict()
++        )
++        self._router: Optional[RouterPolicy] = None
++        if self.trace_dir:
++            os.makedirs(self.trace_dir, exist_ok=True)
++        logger.info(
++            "RoutedDecoding: block_size=%d ar_chunk=%d threshold=%s "
++            "policy_mode=%s trace_dir=%s",
++            self.block_size,
++            self.ar_chunk,
++            self.threshold,
++            self.policy_mode,
++            self.trace_dir,
++        )
++
++    def setup(self, model_runner: ModelRunner) -> None:
++        router = model_runner.model.router
++        if self.router_checkpoint:
++            loaded = RouterPolicy.load(self.router_checkpoint)
++            router.load_state_dict(loaded.state_dict())
++            logger.info("RoutedDecoding: loaded router %s", self.router_checkpoint)
++        self._router = router
++
++    def run(
++        self,
++        model_runner: ModelRunner,
++        forward_batch: ForwardBatch,
++        algo_states=None,
++    ):
++        if self._router is None:
++            self.setup(model_runner)
++        if not (forward_batch.input_ids == self.mask_id).any():
++            return self._prefill(model_runner=model_runner, forward_batch=forward_batch)
++
++        bs = forward_batch.dllm_block_size or self.block_size
++        rids = list(forward_batch.rids[: forward_batch.batch_size])
++        self._decide(rids=rids)
++        states = [self._states[r] for r in rids]
++        for b, s in enumerate(states):
++            forward_batch.input_ids[b * bs] = s.seed
++
++        steps = self._denoise(
++            model_runner=model_runner,
++            forward_batch=forward_batch,
++            dlm_idx=[b for b, s in enumerate(states) if s.mode == ACTION_DLM],
++            bs=bs,
++        )
++        out = self._causal_commit_pass(
++            model_runner=model_runner, forward_batch=forward_batch
++        )
++        next_token_ids = self._finish_call(
++            rids=rids,
++            states=states,
++            ids=forward_batch.input_ids,
++            full_logits=out.logits_output.full_logits,
++            hidden=model_runner.model.last_hidden_states,
++            steps=steps,
++            bs=bs,
++            eos_id=self._get_eos_id(model_runner),
++        )
++        return out.logits_output, next_token_ids, None, None, out.can_run_graph
++
++    # ------------------------------------------------------------- prefill
++    def _prefill(self, *, model_runner: ModelRunner, forward_batch: ForwardBatch):
++        """Prompt pass (no masks): store seed and boundary state per request."""
++        if forward_batch.input_ids.numel() == 0:
++            empty = LogitsProcessorOutput(next_token_logits=None, full_logits=None)
++            return empty, [], None, None, False
++        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++        next_logits = out.logits_output.next_token_logits
++        hidden = model_runner.model.last_hidden_states
++        last_idx = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
++        for b, rid in enumerate(forward_batch.rids[: forward_batch.batch_size]):
++            # Chunked prefill: the last chunk's state overwrites earlier ones.
++            self._remember(
++                rid=rid,
++                state=_ReqState(
++                    seed=self._argmax_token(next_logits[b]),
++                    hidden=hidden[last_idx[b]].detach().clone(),
++                    logits=next_logits[b].detach().clone(),
++                ),
++            )
++        return out.logits_output, [], None, None, out.can_run_graph
++
++    # ------------------------------------------------------------- decide
++    def _decide(self, *, rids: List[str]) -> None:
++        """Runs the router for requests at a decision point."""
++        need = [r for r in rids if self._states[r].mode is None]
++        if not need:
++            return
++        states = [self._states[r] for r in need]
++        device = states[0].hidden.device
++        feats = RouterPolicy.features(
++            torch.stack([s.hidden for s in states]),
++            torch.stack([s.logits for s in states]),
++            torch.tensor([float(s.last_dlm) for s in states], device=device),
++        )
++        actions, logp = self._router.act(feats, mode=self.policy_mode)
++        feats_fp16 = feats.to(torch.float16).cpu().numpy()
++        for i, (rid, s) in enumerate(zip(need, states)):
++            s.mode = int(actions[i])
++            s.ar_left = 0 if s.mode == ACTION_DLM else self.ar_chunk
++            self._trace(
++                rid=rid,
++                record={
++                    "type": "decision",
++                    "action": s.mode,
++                    "logp": float(logp[i]),
++                    "num_generated": s.num_generated,
++                    "features": base64.b64encode(feats_fp16[i].tobytes()).decode(),
++                },
++            )
++
++    # ------------------------------------------------------------- denoise
++    def _denoise(
++        self,
++        *,
++        model_runner: ModelRunner,
++        forward_batch: ForwardBatch,
++        dlm_idx: List[int],
++        bs: int,
++    ) -> List[int]:
++        """Fills diffusion blocks; returns denoising passes per request."""
++        ids = forward_batch.input_ids
++        steps = [0] * forward_batch.batch_size
++        active = list(dlm_idx)
++        for _ in range(bs):
++            active = [
++                b for b in active if (ids[b * bs : (b + 1) * bs] == self.mask_id).any()
++            ]
++            if not active:
++                break
++            fb = (
++                forward_batch
++                if len(active) == forward_batch.batch_size
++                else self._compact_forward_batch(forward_batch, active)
++            )
++            full = model_runner.forward(fb, pp_proxy_tensors=None).logits_output.full_logits
++            for i, b in enumerate(active):
++                steps[b] += 1
++                self._unmask_step(
++                    block=ids[b * bs : (b + 1) * bs], logits=full[i * bs : (i + 1) * bs]
++                )
++        return steps
++
++    def _unmask_step(self, *, block: torch.Tensor, logits: torch.Tensor) -> None:
++        """Commits the most confident mask plus all masks >= threshold."""
++        mask = block == self.mask_id
++        x0, conf = self._compute_confidence(logits, mask, block, torch.zeros_like(mask))
++        k = max(1, int((conf >= self.threshold).sum()))
++        k = min(k, int(mask.sum()))
++        _, top = torch.topk(conf, k=k)
++        block[top] = x0[top]
++
++    # ------------------------------------------------------------- commit
++    def _causal_commit_pass(
++        self, *, model_runner: ModelRunner, forward_batch: ForwardBatch
++    ):
++        """One causal pass over all blocks; persists KV."""
++        forward_batch.dllm_causal_kv_update = True
++        try:
++            return model_runner.forward(forward_batch, pp_proxy_tensors=None)
++        finally:
++            forward_batch.dllm_causal_kv_update = False
++
++    def _finish_call(
++        self,
++        *,
++        rids: List[str],
++        states: List[_ReqState],
++        ids: torch.Tensor,
++        full_logits: torch.Tensor,
++        hidden: torch.Tensor,
++        steps: List[int],
++        bs: int,
++        eos_id: Optional[int],
++    ) -> List[torch.Tensor]:
++        """Returns committed tokens and advances each request's state."""
++        next_token_ids = []
++        for b, (rid, s) in enumerate(zip(rids, states)):
++            is_dlm = s.mode == ACTION_DLM
++            tokens = ids[b * bs : (b + 1) * bs].clone() if is_dlm else ids[b * bs : b * bs + 1].clone()
++            finished = eos_id is not None and bool((tokens == eos_id).any())
++            if finished:
++                tokens = tokens[: int((tokens == eos_id).to(torch.int32).argmax()) + 1]
++            next_token_ids.append(tokens)
++            self._trace(
++                rid=rid,
++                record={
++                    "type": "call",
++                    "action": s.mode,
++                    "tokens": int(tokens.numel()),
++                    "nfe": steps[b] + 1,
++                },
++            )
++            if finished:
++                self._states.pop(rid, None)
++                continue
++            pos = b * bs + (bs - 1 if is_dlm else 0)
++            s.num_generated += int(tokens.numel())
++            s.seed = self._argmax_token(full_logits[pos])
++            s.hidden = hidden[pos].detach().clone()
++            s.logits = full_logits[pos].detach().clone()
++            s.last_dlm = is_dlm
++            s.ar_left = s.ar_left - 1 if not is_dlm else 0
++            if s.ar_left <= 0:
++                s.mode = None
++        return next_token_ids
++
++    # ------------------------------------------------------------- helpers
++    def _argmax_token(self, logits: torch.Tensor) -> int:
++        logits = logits.float().clone()
++        logits[self.mask_id] = -np.inf
++        return int(torch.argmax(logits))
++
++    def _remember(self, *, rid: str, state: _ReqState) -> None:
++        self._states[rid] = state
++        self._states.move_to_end(rid)
++        while len(self._states) > _MAX_TRACKED_REQUESTS:
++            self._states.popitem(last=False)
++
++    def _trace(self, *, rid: str, record: dict) -> None:
++        if not self.trace_dir:
++            return
++        with open(os.path.join(self.trace_dir, f"{rid}.jsonl"), "a") as f:
++            f.write(json.dumps(record) + "\n")
++
++
++Algorithm = RoutedDecoding
+diff --git a/python/sglang/srt/models/nemotron_labs_dllm.py b/python/sglang/srt/models/nemotron_labs_dllm.py
+index 27ca2ae5b..a3d3041a7 100644
+--- a/python/sglang/srt/models/nemotron_labs_dllm.py
++++ b/python/sglang/srt/models/nemotron_labs_dllm.py
+@@ -8,6 +8,7 @@ import torch
+ from torch import nn
+ from transformers.configuration_utils import PretrainedConfig
+ 
++from sglang.srt.dllm.router_policy import RouterPolicy
+ from sglang.srt.distributed import (
+     get_pp_group,
+     get_tensor_model_parallel_world_size,
+@@ -608,6 +609,13 @@ class NemotronLabsDiffusionModel(nn.Module):
+                 prefix=add_prefix("diffusion_head", prefix),
+             )
+         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
++        # AR/diffusion router for the RoutedDecoding algorithm. Not in the HF
++        # checkpoint: starts at p=0.5 and is set via router weight updates
++        # (`router.*` names) or the algorithm's `router_checkpoint`.
++        self.router = RouterPolicy(config.hidden_size).float()
++        # Final (post-norm) hidden states of the latest forward, read by
++        # RoutedDecoding. Requires eager execution (no CUDA graphs).
++        self.last_hidden_states: Optional[torch.Tensor] = None
+ 
+     @property
+     def start_layer(self):
+@@ -629,6 +637,7 @@ class NemotronLabsDiffusionModel(nn.Module):
+         hidden_states = self.model(
+             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+         )
++        self.last_hidden_states = hidden_states
+         if self.pp_group.is_last_rank:
+             return self.logits_processor(
+                 input_ids, hidden_states, self.diffusion_head, forward_batch

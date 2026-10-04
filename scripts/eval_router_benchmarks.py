@@ -6,7 +6,8 @@ expected diffusion token share; p=0 is pure AR, p=1 pure diffusion), and
 `entropy:<nats>` uses diffusion when the next-token entropy at the decision
 point is below the threshold. A suffix `@ar<n>` (e.g. `entropy:0.5@ar1`)
 sets the AR segment length, i.e. how many AR tokens are decoded before the
-router decides again (default `--ar-chunk`). Generation runs several worker
+router decides again (default `--ar-chunk`). `learned:<checkpoint>` runs a
+trained `RouterPolicy` with greedy decisions. Generation runs several worker
 processes per GPU; each loads the model once and takes every n-th item from a
 priority-ordered list (settings in the order given), appending results to its
 own JSONL file, so a rerun resumes where it stopped.
@@ -23,6 +24,7 @@ never on the host.
 """
 
 import argparse
+import functools
 import hashlib
 import json
 import math
@@ -100,13 +102,23 @@ def make_router(setting: str, bench: str, idx: int):  # noqa: ANN201
     """Builds the router for one item of one setting."""
     from src import router as router_lib  # noqa: PLC0415
 
-    kind, value = setting.partition("@")[0].split(":")
+    kind, value = setting.partition("@")[0].split(":", 1)
     if kind == "random":
         p = float(value)
         return router_lib.RandomRouter(p, item_seed(p, bench, idx))
     if kind == "entropy":
         return router_lib.EntropyRouter(float(value))
+    if kind == "learned":
+        return router_lib.LearnedRouter(load_policy(value), mode="greedy")
     raise ValueError(f"unknown setting {setting!r}")
+
+
+@functools.cache
+def load_policy(path: str):  # noqa: ANN201
+    """Loads a router checkpoint once per worker process."""
+    from src import router_policy  # noqa: PLC0415
+
+    return router_policy.RouterPolicy.load(path)
 
 
 def item_seed(p_dlm: float, bench: str, idx: int) -> int:

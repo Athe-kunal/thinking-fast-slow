@@ -11,6 +11,8 @@ from typing import Literal, Protocol
 
 import torch
 
+from src import router_policy
+
 Mode = Literal["ar", "dlm"]
 
 
@@ -119,6 +121,61 @@ class RandomRouter:
     def __call__(self, state: RouterState) -> Mode:
         """Returns "dlm" with probability `p_dlm`, else "ar"."""
         return "dlm" if self._rng.random() < self.p_dlm else "ar"
+
+
+@dataclasses.dataclass
+class Decision:
+    """One routing decision made by a `LearnedRouter`."""
+
+    features: torch.Tensor
+    action: int
+    logp: float
+    num_generated: int
+
+
+class LearnedRouter:
+    """Adapts a `RouterPolicy` to the `Router` protocol and records decisions.
+
+    Attributes:
+        policy: The learned policy.
+        mode: Action mode passed to `RouterPolicy.act` ("greedy" for eval,
+            "sample" for exploration).
+        trace: Decisions made since the last `reset`.
+    """
+
+    def __init__(self, policy: router_policy.RouterPolicy, mode: str) -> None:
+        """Initializes the router.
+
+        Args:
+            policy: The learned policy.
+            mode: Action mode for `RouterPolicy.act`.
+        """
+        self.policy = policy
+        self.mode = mode
+        self.trace: list[Decision] = []
+
+    def reset(self) -> None:
+        """Clears the decision trace (call between generations)."""
+        self.trace = []
+
+    def __call__(self, state: RouterState) -> Mode:
+        """Returns the policy's action for this decision point."""
+        device = state.hidden.device
+        self.policy.to(device)
+        last_dlm = torch.tensor(
+            [float(state.last_mode == "dlm")], device=device
+        )
+        feats = router_policy.RouterPolicy.features(
+            state.hidden[None], state.next_logit[None], last_dlm
+        )
+        actions, logp = self.policy.act(feats, mode=self.mode)
+        action = int(actions[0])
+        self.trace.append(
+            Decision(
+                feats[0].cpu(), action, float(logp[0]), state.num_generated
+            )
+        )
+        return "dlm" if action == router_policy.ACTION_DLM else "ar"
 
 
 ROUTERS = ("entropy", "cycle", "random")
