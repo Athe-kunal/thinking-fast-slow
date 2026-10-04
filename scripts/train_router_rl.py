@@ -29,6 +29,8 @@ import json
 import os
 import pathlib
 import random
+import secrets
+import signal
 import subprocess
 import time
 import typing
@@ -84,11 +86,14 @@ class Server:
             "MAX_REQS": str(args.max_reqs),
             "MEM_FRAC": str(args.mem_frac),
         }
+        # Own process group, so stop() also reaches SGLang's child processes
+        # (scheduler, detokenizer).
         self.proc = subprocess.Popen(
             [str(ROOT / "scripts/launch_sglang.sh"), "routed"],
             env=env,
             stdout=self.log_path.open("a"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     def wait_ready(self, timeout: float = 900) -> None:
@@ -107,10 +112,26 @@ class Server:
         raise TimeoutError(f"server on GPU {self.gpu} not ready")
 
     def stop(self) -> None:
-        """Terminates the server process group."""
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.terminate()
-            self.proc.wait(timeout=60)
+        """Stops the whole server process group; never raises.
+
+        SIGTERM first, SIGKILL if the group is still alive after 60 s.
+        """
+        if self.proc is None:
+            return
+        try:
+            pgid = os.getpgid(self.proc.pid)
+        except ProcessLookupError:
+            return
+        for sig, wait in ((signal.SIGTERM, 60), (signal.SIGKILL, 10)):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                return
+            try:
+                self.proc.wait(timeout=wait)
+                return
+            except subprocess.TimeoutExpired:
+                log(f"server on GPU {self.gpu} still alive after {sig.name}")
 
 
 def push_router(
@@ -142,24 +163,33 @@ def push_router(
 
 
 # ----------------------------------------------------------------- rollouts
-def read_trace(path: pathlib.Path) -> dict:
-    """Parses and deletes one rollout's trace file."""
-    decisions, tokens, nfe, dlm_tokens = [], 0, 1, 0  # nfe starts at prefill
+def read_trace(path: pathlib.Path, completion_tokens: int) -> dict:
+    """Parses and deletes one rollout's trace file.
+
+    Args:
+        path: The rollout's trace file.
+        completion_tokens: Tokens the server actually returned. The trace
+            counts whole committed blocks, but the scheduler truncates the
+            last block at max_new_tokens, so the server count is the true
+            denominator for the cost; forward passes are counted as spent.
+    """
+    decisions, traced_tokens, nfe, dlm_tokens = [], 0, 1, 0  # nfe: prefill
     for line in path.read_text().splitlines():
         r = json.loads(line)
         if r["type"] == "decision":
-            feats = np.frombuffer(base64.b64decode(r["features"]), np.float16)
-            decisions.append((feats.astype(np.float32), r["action"], r["logp"]))
+            feats = np.frombuffer(base64.b64decode(r["features"]), np.float32)
+            decisions.append((feats.copy(), r["action"], r["logp"]))
         else:
-            tokens += r["tokens"]
+            traced_tokens += r["tokens"]
             nfe += r["nfe"]
             dlm_tokens += r["tokens"] if r["action"] == 1 else 0
     path.unlink()
+    tokens = min(traced_tokens, completion_tokens)
     return {
         "decisions": decisions,
         "tokens": tokens,
         "nfe": nfe,
-        "dlm_tokens": dlm_tokens,
+        "dlm_tokens": min(dlm_tokens, tokens),
     }
 
 
@@ -170,9 +200,12 @@ def run_rollout(server: Server, rid: str, input_ids: list, max_tokens: int):
         "rid": rid,
         "sampling_params": {"max_new_tokens": max_tokens, "temperature": 0},
     }
+    trace_path = server.trace_dir / f"{rid}.jsonl"
+    trace_path.unlink(missing_ok=True)  # never append to a stale trace
     try:
         out = http_post(server.port, "generate", payload, 1800)
-        return out["text"], read_trace(server.trace_dir / f"{rid}.jsonl")
+        completion = int(out["meta_info"]["completion_tokens"])
+        return out["text"], read_trace(trace_path, completion)
     except (OSError, KeyError, json.JSONDecodeError) as e:
         log(f"rollout {rid} failed: {e}")
         return None
@@ -270,7 +303,7 @@ def iteration(
     t0 = time.time()
     batch = rl_data.sample_batch(items, args.weights, args.prompts, rng)
     jobs = [
-        (g, item, f"it{it}-p{g}-r{k}")
+        (g, item, f"{args.run_tag}-it{it}-p{g}-r{k}")
         for g, item in enumerate(batch)
         for k in range(args.group_size)
     ]
@@ -389,6 +422,9 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.multiprocessing.set_sharing_strategy("file_system")
+    # Per-process tag in every request id: a resumed run replays iteration
+    # numbers, and must never read trace files left by the crashed attempt.
+    args.run_tag = secrets.token_hex(4)
     torch.manual_seed(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "args.json").write_text(json.dumps(vars(args), default=str))

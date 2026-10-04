@@ -59,12 +59,39 @@ class RouterPolicy(nn.Module):
         Returns:
             (batch, hidden_size + NUM_SCALAR_FEATURES) float32 features.
         """
+        entropy, top1 = RouterPolicy.logit_stats(next_logits)
+        return RouterPolicy.assemble(hidden, entropy, top1, last_dlm)
+
+    @staticmethod
+    def logit_stats(
+        next_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Entropy (nats) and top-1 probability of next-token logits.
+
+        These are the only logit-derived features, so callers that keep state
+        between decisions can store two floats instead of the vocab logits.
+        """
         log_probs = torch.log_softmax(next_logits.float(), dim=-1)
         probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1)
-        top1 = probs.max(dim=-1).values
+        return entropy, probs.max(dim=-1).values
+
+    @staticmethod
+    def assemble(
+        hidden: torch.Tensor,
+        entropy: torch.Tensor,
+        top1: torch.Tensor,
+        last_dlm: torch.Tensor,
+    ) -> torch.Tensor:
+        """Concatenates hidden state and scalar features (float32)."""
+        device = hidden.device
         scalars = torch.stack(
-            [entropy, top1, last_dlm.float().to(entropy.device)], dim=-1
+            [
+                entropy.float().to(device),
+                top1.float().to(device),
+                last_dlm.float().to(device),
+            ],
+            dim=-1,
         )
         return torch.cat([hidden.float(), scalars], dim=-1)
 

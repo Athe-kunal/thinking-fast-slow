@@ -14,17 +14,17 @@ index 3d9a15552..f086211f2 100644
              return {"page_size": 1}
 diff --git a/python/sglang/srt/dllm/algorithm/routed.py b/python/sglang/srt/dllm/algorithm/routed.py
 new file mode 100644
-index 000000000..463f52195
+index 000000000..bed85ec34
 --- /dev/null
 +++ b/python/sglang/srt/dllm/algorithm/routed.py
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,305 @@
 +"""Routed decoding: a learned router picks AR or block diffusion per segment.
 +
 +Mirrors the HF reference decoder in thinking-fast-slow's `src/interleave.py`:
 +
 +- After the prompt prefill, each request has a seed token (argmax of the causal
-+  next-token logits) and a boundary state (final hidden state + logits at the
-+  last committed token).
++  next-token logits) and a boundary state (final hidden state + logit
++  statistics at the last committed token).
 +- At a decision point the `RouterPolicy` (model submodule `router`) picks AR
 +  (decode `ar_chunk` tokens, one per call) or diffusion (one block: seed at
 +  position 0, remaining positions denoised with confidence-threshold
@@ -33,8 +33,13 @@ index 000000000..463f52195
 +  commit 1 token, diffusion requests commit the whole block (truncated after
 +  EOS). The scheduler frees the KV of uncommitted positions.
 +
-+Per-request decisions (features, action, log-prob) and per-call costs are
-+appended to `<trace_dir>/<rid>.jsonl` for RL training.
++Per-request decisions (float32 features, action, log-prob) and per-call costs
++are appended to `<trace_dir>/<rid>.jsonl` for RL training.
++
++Per-request state is kept on the CPU and holds only the router features
++(hidden state + two logit statistics), ~12 KB per request. Requests that end
++without EOS (length limit, abort) are never seen finishing here; their state
++is evicted by the LRU cap.
 +"""
 +
 +import base64
@@ -64,8 +69,9 @@ index 000000000..463f52195
 +    """Per-request routing state between scheduler calls."""
 +
 +    seed: int
-+    hidden: torch.Tensor  # (hidden,) causal state at the last committed token
-+    logits: torch.Tensor  # (vocab,) causal next-token logits there
++    hidden: torch.Tensor  # (hidden,) float32 CPU, causal state at boundary
++    entropy: float  # next-token entropy (nats) at the boundary
++    top1: float  # next-token top-1 probability at the boundary
 +    last_dlm: bool = False
 +    mode: Optional[int] = None  # action of the current segment, None = decide
 +    ar_left: int = 0
@@ -155,14 +161,17 @@ index 000000000..463f52195
 +        next_logits = out.logits_output.next_token_logits
 +        hidden = model_runner.model.last_hidden_states
 +        last_idx = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
++        entropy, top1 = RouterPolicy.logit_stats(next_logits)
++        hidden_cpu = hidden[last_idx].float().cpu()
 +        for b, rid in enumerate(forward_batch.rids[: forward_batch.batch_size]):
 +            # Chunked prefill: the last chunk's state overwrites earlier ones.
 +            self._remember(
 +                rid=rid,
 +                state=_ReqState(
 +                    seed=self._argmax_token(next_logits[b]),
-+                    hidden=hidden[last_idx[b]].detach().clone(),
-+                    logits=next_logits[b].detach().clone(),
++                    hidden=hidden_cpu[b],
++                    entropy=float(entropy[b]),
++                    top1=float(top1[b]),
 +                ),
 +            )
 +        return out.logits_output, [], None, None, out.can_run_graph
@@ -174,14 +183,15 @@ index 000000000..463f52195
 +        if not need:
 +            return
 +        states = [self._states[r] for r in need]
-+        device = states[0].hidden.device
-+        feats = RouterPolicy.features(
++        feats = RouterPolicy.assemble(
 +            torch.stack([s.hidden for s in states]),
-+            torch.stack([s.logits for s in states]),
-+            torch.tensor([float(s.last_dlm) for s in states], device=device),
++            torch.tensor([s.entropy for s in states]),
++            torch.tensor([s.top1 for s in states]),
++            torch.tensor([float(s.last_dlm) for s in states]),
 +        )
-+        actions, logp = self._router.act(feats, mode=self.policy_mode)
-+        feats_fp16 = feats.to(torch.float16).cpu().numpy()
++        device = next(self._router.parameters()).device
++        actions, logp = self._router.act(feats.to(device), mode=self.policy_mode)
++        feats_np = feats.numpy()  # float32, exactly what the policy saw
 +        for i, (rid, s) in enumerate(zip(need, states)):
 +            s.mode = int(actions[i])
 +            s.ar_left = 0 if s.mode == ACTION_DLM else self.ar_chunk
@@ -192,7 +202,7 @@ index 000000000..463f52195
 +                    "action": s.mode,
 +                    "logp": float(logp[i]),
 +                    "num_generated": s.num_generated,
-+                    "features": base64.b64encode(feats_fp16[i].tobytes()).decode(),
++                    "features": base64.b64encode(feats_np[i].tobytes()).decode(),
 +                },
 +            )
 +
@@ -284,8 +294,9 @@ index 000000000..463f52195
 +            pos = b * bs + (bs - 1 if is_dlm else 0)
 +            s.num_generated += int(tokens.numel())
 +            s.seed = self._argmax_token(full_logits[pos])
-+            s.hidden = hidden[pos].detach().clone()
-+            s.logits = full_logits[pos].detach().clone()
++            s.hidden = hidden[pos].float().cpu()
++            entropy, top1 = RouterPolicy.logit_stats(full_logits[pos])
++            s.entropy, s.top1 = float(entropy), float(top1)
 +            s.last_dlm = is_dlm
 +            s.ar_left = s.ar_left - 1 if not is_dlm else 0
 +            if s.ar_left <= 0:

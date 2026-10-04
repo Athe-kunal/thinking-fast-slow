@@ -262,11 +262,37 @@ outcome + compute cost, possibly with a supervised warm start), backbone frozen.
 - **Diagnosis (inferred, not yet measured):** with a greedy backbone the G rollouts of a prompt differ only in routing; most groups are all-correct or all-wrong, so reward differences are just the cost term (~0.01-0.05). GRPO's per-group std normalization inflates these to ~unit advantages, so almost every update favours diffusion and the rare groups where routing changes correctness are outvoted; exploration dies within ~20 iterations.
 - **Correction from run2's logging (same data/settings):** groups where routing changes correctness are *not* rare: 22-47% of prompt groups in the first 5 iterations. Revised diagnosis: the remaining majority of groups differ only in cost, and std normalization gave each of them unit-size "more diffusion" advantages, while a correctness flip in a mixed group is credited to all ~15 decisions of the rollout (noisier per-decision signal). A large consistent weak signal outweighed a smaller noisy strong one.
 
-### E12. Router GRPO run2: unnormalized advantages + stronger entropy (2026-10-04, running)
+### E12. Router GRPO run2: unnormalized advantages + stronger entropy (2026-10-04)
 
 - **Changes vs E11 (only):** advantage = reward - group mean (`--adv-norm none`); entropy coefficient 0.01 -> 0.05 (equivalent to a pull toward p=0.5). New logs: `mixed_correct_group_frac`, `group_reward_std`.
-- **Early iterations (0-4):** mixed-correct groups 0.22-0.47; mean p(diffusion) 0.50 -> 0.46 (drifting toward AR, not collapsing to diffusion).
-- **Results:** pending.
+- **Training (100 iterations, 0 failed rollouts):** no collapse, but no learning either: mean p(diffusion) 0.48-0.52 in every 10-iteration window, policy entropy 0.690-0.693 (max 0.693), diffusion token share ~0.78-0.80, tokens/forward ~1.75-1.80; mixed-correct groups 0.28-0.40 per window (signal present). Final output layer weight norm 0.05 (zero init), bias -0.003: the entropy bonus pinned the policy at p~0.5.
+- **Held-out eval (greedy decisions, @ar8):**
+
+  | router | HumanEval acc | diffusion share | tokens/forward | mean length | GSM8K acc (share) |
+  |---|---|---|---|---|---|
+  | run2 it100 | 76.2% | 79.2% | 2.58 | 208 | 86.7% (90.7%) |
+  | run2 it50 | 75.0% | 80.0% | 1.89 | 423 | - |
+  | control A: it100 first layer + random-direction output (same norm) | 79.3% | 45.3% | 1.54 | 209 | - |
+  | control B: fresh init + random-direction output (same norm) | 75.0% | 70.3% | 2.22 | 208 | - |
+  | random:0.8 / 0.9 / 1.0 (E5, E7) | 69.5 / 73.8 / 72.6% | 80 / 91 / 100% | 1.96 / 2.22 / 2.46 | 374 / 395 / 415 | - |
+  | AR (E5) | 80.5% | 0% | 1.00 | 210 | 87.3% |
+
+  Paired McNemar (HumanEval): it100 vs random:0.8 20 vs 9, p=0.061; vs random:0.9 p=0.57; vs random:1.0 p=0.38; vs entropy:0.5 p=1.0; vs AR 6 vs 13, p=0.17; vs control A p=0.44; vs control B p=0.84; vs it50 p=0.85. GSM8K vs AR p=0.50.
+- **Key finding: the first segment's mode sets the answer's style.** AR first -> the model writes code directly (~200 tokens); diffusion first -> it writes an explanation first (~420 tokens). Holds across routers; for random:0.5 (52% AR-first) AR-first answers are 198 tokens / 79.1% correct vs diffusion-first 448 tokens / 73.1%. HumanEval prompts all end in the same chat-template tokens, so a deterministic router's first decision is effectively a constant: run2 it100 and both controls always start with AR (short answers); run2 it50 and run1 always start with diffusion (long answers).
+- **Conclusion:** run2's router did not learn routing (weights barely moved; random-direction controls reproduce its behaviour; it50 vs it100 differ only in the first-decision constant). Its favourable HumanEval numbers come from always choosing AR first. Not significant vs comparable routers. Untested candidate rule suggested by this: AR for the first segment, then diffusion (or entropy routing) afterwards.
+- **RL takeaways:** std-normalized GRPO collapses to diffusion (E11); unnormalized advantages with entropy 0.05 does not move the policy at all (E12). Next attempts need a weaker entropy bonus (e.g. 0.01-0.02) or per-decision credit (e.g. reward-to-go / position-aware baselines), and evaluation should report first-decision behaviour separately.
+
+### Fixes after code review (2026-10-04)
+
+Applied before any further router training; E11/E12 ran without them.
+1. **Per-request router state no longer held on the GPU.** RoutedDecoding kept each request's boundary hidden state and full-vocabulary logits (~0.5 MB) on the GPU and only freed them on EOS; requests ending at the length limit or aborted leaked until a 20k-entry LRU cap. State now holds only the router features (hidden on CPU in float32, entropy, top-1; ~12 KB). No GPU memory growth was seen in E12 (66.7/67.1 GB at iteration 8, about the start level), so E11/E12 were not affected in practice.
+2. **Cost denominator uses the tokens actually returned.** The trace counts whole committed diffusion blocks, but the scheduler truncates the last block at `max_new_tokens`; the trainer now uses the server's `completion_tokens` (forward passes still counted as spent). E11/E12 slightly underestimated diffusion's cost on truncated rollouts (a small extra pull toward diffusion).
+3. **Resume safety.** Request ids carry a per-process run tag and stale trace files are deleted before sending, so a resumed run never mixes in traces from a crashed attempt.
+4. **Server shutdown.** Servers start in their own process group; `stop()` sends SIGTERM to the group, escalates to SIGKILL after 60 s and never raises.
+5. **Full-precision traces.** Decision features are now traced as float32 (was fp16): the trainer recomputes exactly what the server acted on (mismatch 6e-8 = float32 CPU-vs-GPU kernel difference).
+   E11/E12 do **not** need retraining for this: their logged trainer-vs-server logp mismatch was max 3.0e-5 (run1, mean 9.3e-6) and max 6.0e-7 (run2), i.e. PPO ratio errors of ~0.003% against a 0.2 clip range. Their failures come from the objective (std normalization; entropy bonus), not precision.
+
+Verified with a 2-iteration run + resume to iteration 3 at a 64-token limit: 48 rollouts, 0 failed, resume OK, 0 leftover server processes.
 
 ## 6. Reference numbers and related work
 
