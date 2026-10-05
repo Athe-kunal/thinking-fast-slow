@@ -118,10 +118,10 @@ def set_dotted(cfg: dict, dotted: str, value: object) -> None:
     node[leaf] = value
 
 
-def expand(path: pathlib.Path) -> list[dict]:
+def expand(path: pathlib.Path, defaults: dict | None = None) -> list[dict]:
     """Loads one experiment file and expands its sweep into runs."""
     raw = yaml.safe_load(path.read_text()) or {}
-    base = merge(DEFAULTS, raw)
+    base = merge(DEFAULTS if defaults is None else defaults, raw)
     base["name"] = base["name"] or path.stem
     sweep = base.pop("sweep") or {}
     if not sweep:

@@ -223,3 +223,6 @@ runs
 third_party/
 .venv-sglang/
 .venv-swebench/
+
+# Workspace-local Claude Code login (credentials)
+.claude-config

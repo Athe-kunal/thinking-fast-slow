@@ -1,0 +1,5 @@
+# E17 reference: the base model, AR, on the same held-out turns.
+train: null
+eval:
+  settings: [base]
+  workers_per_gpu: 6

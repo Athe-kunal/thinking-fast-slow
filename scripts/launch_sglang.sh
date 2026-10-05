@@ -5,6 +5,7 @@
 #   scripts/launch_sglang.sh linear_spec  # diffusion draft + AR verify
 #   scripts/launch_sglang.sh ar           # pure autoregressive
 #   scripts/launch_sglang.sh routed       # learned AR/diffusion router
+#   MODEL=<merged export> scripts/launch_sglang.sh span   # model-emitted <diff> spans
 #
 # One mode per server: SGLang picks the decoding algorithm at launch.
 # Env overrides: MODEL, PORT, MEM_FRAC, MAX_REQS, CTX_LEN, ATTN_BACKEND.
@@ -16,7 +17,7 @@
 # Set up the environment first with scripts/setup_sglang.sh.
 set -euo pipefail
 
-mode="${1:?usage: launch_sglang.sh <dlm|linear_spec|ar|routed>}"
+mode="${1:?usage: launch_sglang.sh <dlm|linear_spec|ar|routed|span>}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
 MODEL="${MODEL:-nvidia/Nemotron-Labs-Diffusion-3B}"
@@ -58,6 +59,21 @@ case "${mode}" in
       if [[ -n "${ROUTER_CKPT:-}" ]]; then
         echo "router_checkpoint: \"${ROUTER_CKPT}\""
       fi
+    } > "${cfg}"
+    graph_args=(--disable-cuda-graph)
+    ;;
+  span)
+    # Model-switched decoding: AR until <diff>, block diffusion until </diff>.
+    # MODEL must be a merged span-SFT export (scripts/export_merged.py).
+    algo=SpanDecoding
+    cfg="$(mktemp --suffix=.yaml)"
+    {
+      echo "algorithm: SpanDecoding"
+      echo "causal_context: true"
+      echo "first_done_first_out_mode: false"
+      echo "threshold: ${THRESHOLD:-0.9}"
+      echo "block_size: ${BLOCK_SIZE:-8}"
+      if [[ -n "${TRACE_DIR:-}" ]]; then echo "trace_dir: \"${TRACE_DIR}\""; fi
     } > "${cfg}"
     graph_args=(--disable-cuda-graph)
     ;;

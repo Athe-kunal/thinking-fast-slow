@@ -1,0 +1,7 @@
+# E17: cold-start span SFT. Thinking / answers AR, tool calls in <diff> spans
+# trained with the Nemotron diffusion loss (block 8, AR loss in spans too).
+data: {diff_spans: true}
+loss: {block_size: 8, ar_in_spans: true}
+eval:
+  settings: [spans, ar]
+  workers_per_gpu: 6

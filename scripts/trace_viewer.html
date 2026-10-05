@@ -1,0 +1,282 @@
+<title>E17 Span Traces</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: summary strip, then a turn index (left) beside the trace reader (right); stacks on phones. */
+:root {
+  --bg: #f3f5f8; --panel: #ffffff; --fg: #1b1f27; --muted: #5b6474; --line: #dbe0e8;
+  --ar-strip: #c3c9d4;
+  --dlm-a: #d6e2ff; --dlm-b: #bcd0ff; --dlm-ink: #16358f; --dlm-strip: #3d63dd;
+  --good: #17734a; --good-bg: #dcf3e7; --bad: #a8261b; --bad-bg: #fbe3e0;
+  --sel: #e8eefc; --warn: #8a5a00; --warn-bg: #fbefd2;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #11141a; --panel: #181c24; --fg: #e3e7ee; --muted: #98a1b0; --line: #2a303b;
+  --ar-strip: #4a5262;
+  --dlm-a: #1d2b55; --dlm-b: #283b72; --dlm-ink: #b4c8ff; --dlm-strip: #6f8fff;
+  --good: #6fd6a2; --good-bg: #17352a; --bad: #ff9a8f; --bad-bg: #3d1d1a;
+  --sel: #222b3d; --warn: #f1c26b; --warn-bg: #3a2e14; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #11141a; --panel: #181c24; --fg: #e3e7ee; --muted: #98a1b0; --line: #2a303b;
+  --ar-strip: #4a5262;
+  --dlm-a: #1d2b55; --dlm-b: #283b72; --dlm-ink: #b4c8ff; --dlm-strip: #6f8fff;
+  --good: #6fd6a2; --good-bg: #17352a; --bad: #ff9a8f; --bad-bg: #3d1d1a;
+  --sel: #222b3d; --warn: #f1c26b; --warn-bg: #3a2e14; color-scheme: dark; }
+
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; }
+.wrap { padding-inline: 16px; padding-block: 16px 32px; max-width: 1400px; margin: 0 auto; display: grid; gap: 14px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0; text-wrap: balance; }
+.sub { color: var(--muted); font-size: 13px; }
+.top { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; }
+.stats { display: flex; flex-wrap: wrap; gap: 6px 22px; font-variant-numeric: tabular-nums; }
+.stat b { display: block; font-size: 17px; font-weight: 600; }
+.stat span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; font-size: 12px; color: var(--muted); }
+.legend code { font-family: var(--mono); font-size: 12px; padding: 1px 6px; border-radius: 3px; color: var(--fg); }
+.lg-ar { background: var(--panel); border: 1px solid var(--line); }
+.lg-dlm { background: var(--dlm-a); color: var(--dlm-ink) !important; box-shadow: inset -3px 0 0 var(--dlm-b); }
+.tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip { font: 500 12px var(--sans); border: 1px solid var(--line); background: var(--panel); color: var(--fg); padding: 5px 11px; border-radius: 999px; cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--fg); color: var(--panel); border-color: var(--fg); }
+.chip:focus-visible, input:focus-visible, .row:focus-visible { outline: 2px solid var(--dlm-strip); outline-offset: 1px; }
+#q { font: 13px var(--sans); padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); min-width: 0; flex: 1 1 180px; max-width: 280px; }
+.main { display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap: 14px; align-items: start; }
+.list { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; max-height: 78vh; overflow-y: auto; }
+.count { padding: 8px 12px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+.row { display: grid; gap: 5px; padding: 9px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.row[aria-selected="true"] { background: var(--sel); }
+.row-h { display: flex; justify-content: space-between; gap: 8px; align-items: center; min-width: 0; }
+.fn { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.pill { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
+.ok { color: var(--good); background: var(--good-bg); } .no { color: var(--bad); background: var(--bad-bg); }
+.strip { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--ar-strip); }
+.strip i { display: block; height: 100%; }
+.strip .a { background: var(--ar-strip); } .strip .d { background: var(--dlm-strip); }
+.meta { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.detail { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: grid; gap: 14px; min-width: 0; }
+.d-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+.d-head .fn { font-size: 14px; white-space: normal; }
+.kv { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.kv b { color: var(--fg); font-weight: 500; }
+.big-strip { height: 10px; border-radius: 4px; }
+.label { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: 6px; }
+pre { margin: 0; font: 12.5px/1.6 var(--mono); white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
+.trace { max-height: 62vh; overflow-y: auto; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
+.blk { color: var(--dlm-ink); background: var(--dlm-a); border-radius: 2px; }
+.blk:nth-of-type(even) { background: var(--dlm-b); }
+.mk { font: 600 10.5px var(--sans); color: var(--panel); background: var(--dlm-strip); padding: 0 5px; border-radius: 3px; margin: 0 2px; vertical-align: 1px; }
+details { border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; }
+summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+details pre { margin-top: 8px; max-height: 40vh; overflow-y: auto; }
+.views { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.views button { font: 500 13px var(--sans); border: 0; background: var(--panel); color: var(--muted); padding: 6px 14px; cursor: pointer; }
+.views button[aria-pressed="true"] { background: var(--fg); color: var(--panel); }
+.views button:focus-visible { outline: 2px solid var(--dlm-strip); outline-offset: -2px; }
+.turn { display: grid; gap: 8px; }
+.turn-h { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 12px; color: var(--muted); }
+.turn-h b { color: var(--fg); font-weight: 600; }
+.toolres { border-left: 3px solid var(--line); padding: 6px 0 6px 12px; color: var(--muted); }
+.toolres pre { max-height: 22vh; overflow-y: auto; }
+.stop { font-size: 12px; color: var(--bad); }
+.warn { color: var(--warn); background: var(--warn-bg); }
+.role { font: 600 11px var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-top: 8px; }
+@media (max-width: 760px) { .main { grid-template-columns: 1fr; } .list { max-height: 40vh; } }
+</style>
+
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>E17 Span Traces</h1>
+      <div class="sub" id="sub"></div>
+    </div>
+    <div class="stats" id="stats"></div>
+  </div>
+  <div class="legend">
+    <span><code class="lg-ar">thinking / answer</code> AR, one token per forward pass</span>
+    <span><code class="lg-dlm">tool call</code> diffusion, alternating shades = 8-token blocks</span>
+    <span><span class="mk">diff</span><span class="mk">/diff</span> span markers the model emits</span>
+  </div>
+  <div class="tools">
+    <div class="views" role="group" aria-label="View">
+      <button data-v="turns" aria-pressed="true">Single turns</button>
+      <button data-v="convs" aria-pressed="false">Conversations</button>
+    </div>
+    <span role="group" aria-label="Filter" id="chips"></span>
+    <input id="q" type="search" placeholder="Filter by function or id" aria-label="Filter by function or id">
+  </div>
+  <div class="main">
+    <div class="list" id="list" role="listbox" aria-label="Turns"></div>
+    <div class="detail" id="detail"></div>
+  </div>
+</div>
+
+<script type="application/json" id="data">__TRACE_DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById("data").textContent);
+const items = D.items;
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, ">");
+const OPEN = "&lt;SPECIAL_18>", CLOSE = "&lt;SPECIAL_19>";
+const marks = s => s.split(OPEN).join('<span class="mk">diff</span>').split(CLOSE).join('<span class="mk">/diff</span>');
+const pct = x => (100 * x).toFixed(1) + "%";
+
+// Forward passes spent inside spans: total minus prefill minus one per AR token
+// (the closing <|im_end|> is not forwarded).
+function dlmPasses(it) {
+  const last = it.segs[it.segs.length - 1];
+  const eos = last && last[0] === "ar" && last[1].endsWith("<|im_end|>") ? 1 : 0;
+  return it.nfe - 1 - (it.ar - eos);
+}
+const withSpans = items.filter(it => it.dlm > 0);
+const spanTok = withSpans.reduce((a, it) => a + it.dlm, 0);
+const spanPass = withSpans.reduce((a, it) => a + dlmPasses(it), 0);
+const S = D.summary;
+document.getElementById("sub").textContent =
+  `${D.run} · decoding: ${D.setting} · ${items.length} held-out turns · diffusion block ${D.block}`;
+document.getElementById("stats").innerHTML = [
+  ["exact call match", pct(S.exact)],
+  ["diffusion share", pct(S.dlm_share)],
+  ["tokens / pass, turn", S.tokens_per_forward.toFixed(2)],
+  ["tokens / pass, in spans", (spanTok / spanPass).toFixed(2)],
+].map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join("");
+
+function strip(it, cls) {
+  const total = it.tokens || 1;
+  return `<div class="strip ${cls || ""}" aria-hidden="true">` + it.segs.map(([m, , n]) =>
+    `<i class="${m === "dlm" ? "d" : "a"}" style="width:${(100 * n / total).toFixed(3)}%"></i>`).join("") + "</div>";
+}
+for (const it of items) it.label = it.calls.length ? it.calls.join(", ") : "text answer";
+
+const R = D.rollouts || [];
+for (const r of R) {
+  r.label = r.turns.map(t => t.calls.length ? t.calls.join(", ") : "answer").join(" → ");
+  r.tokens = r.turns.reduce((a, t) => a + t.tokens, 0);
+  r.nfe = r.turns.reduce((a, t) => a + t.nfe, 0);
+  r.dlm = r.turns.reduce((a, t) => a + t.dlm, 0);
+  r.segs = r.turns.flatMap(t => t.segs);
+}
+const CHIPS = {
+  turns: [["all", "All"], ["span", "With diffusion"], ["answer", "Text answers"], ["wrong", "Wrong"]],
+  convs: [["all", "All"], ["done", "Reached the final answer"], ["stopped", "Stopped early"], ["multi", "3+ turns"]],
+};
+let view = "turns", filter = "all", query = "", shown = [], sel = 0;
+function renderChips() {
+  document.getElementById("chips").innerHTML = CHIPS[view].map(([f, l]) =>
+    `<button class="chip" data-f="${f}" aria-pressed="${f === filter}">${l}</button>`).join(" ");
+}
+function convMatches(r) {
+  if (filter === "done" && !r.completed) return false;
+  if (filter === "stopped" && r.completed) return false;
+  if (filter === "multi" && r.turns.length < 3) return false;
+  if (query && !(r.label.toLowerCase().includes(query) || r.id.includes(query))) return false;
+  return true;
+}
+function traceHtml(segs) {
+  let k = 0;
+  return segs.map(([m, t]) => m === "ar" ? marks(esc(t))
+    : t.map(b => `<span class="blk" title="diffusion block ${++k}">${marks(esc(b))}</span>`).join("")).join("");
+}
+function renderConvList() {
+  shown = R.filter(convMatches);
+  const list = document.getElementById("list");
+  if (!R.length) { list.innerHTML = '<div class="count">No rollouts in this build. Run scripts.rollout_toolcall, then rebuild.</div>'; renderConvDetail(); return; }
+  list.innerHTML = `<div class="count">${shown.length} of ${R.length} conversations · longest first</div>` +
+    shown.map((r, i) => `<div class="row" role="option" tabindex="0" data-i="${i}" aria-selected="${i === sel}">
+      <div class="row-h"><span class="fn">${esc(r.label)}</span><span class="pill ${r.completed ? "ok" : "no"}">${r.turns.length}/${r.ref_turns}</span></div>
+      ${strip(r)}
+      <div class="meta">${r.turns.length} turns · ${r.tokens} tokens · ${r.dlm} by diffusion</div>
+    </div>`).join("");
+  if (sel >= shown.length) sel = 0;
+  renderConvDetail();
+}
+function renderConvDetail() {
+  const el = document.getElementById("detail");
+  const r = shown[sel];
+  if (!r) { el.innerHTML = '<div class="sub">No conversations match this filter. Choose All or clear the search box.</div>'; return; }
+  const last = r.turns[r.turns.length - 1];
+  const stopped = !r.completed && last && !last.names_match
+    ? `<div class="stop">Rollout stopped: the model ${last.calls.length ? "called " + esc(last.calls.join(", ")) : "answered in text"}, the reference ${last.ref_calls.length ? "called " + esc(last.ref_calls.join(", ")) : "answered in text"}. The dataset has no tool result for that.</div>` : "";
+  el.innerHTML = `
+    <div class="d-head"><span class="fn">${esc(r.label)}</span>
+      <span class="pill ${r.completed ? "ok" : "no"}">${r.completed ? "reached the final answer" : "stopped early"}</span></div>
+    <div class="kv"><span><b>${r.turns.length}</b> of ${r.ref_turns} reference turns</span><span><b>${r.tokens}</b> tokens</span>
+      <span><b>${r.nfe}</b> forward passes</span><span><b>${r.dlm}</b> diffusion tokens</span>
+      <span><b>${(r.tokens / r.nfe).toFixed(2)}</b> tokens / pass</span></div>
+    ${strip(r, "big-strip")}
+    <div class="toolres"><div class="role">user</div><pre>${esc(r.user)}</pre></div>
+    ${r.turns.map((t, i) => `<div class="turn">
+      <div class="turn-h"><b>Assistant turn ${i + 1}</b>
+        <span>${t.calls.length ? "calls " + esc(t.calls.join(", ")) : "text answer"}</span>
+        <span class="pill ${t.match ? "ok" : t.names_match ? "warn" : "no"}">${t.match ? "matches reference" : t.names_match ? "same function, other arguments" : "differs"}</span>
+        <span>${t.tokens} tokens · ${t.dlm} by diffusion · ${t.nfe} passes</span></div>
+      <pre class="trace">${traceHtml(t.segs)}</pre>
+      ${t.after && i < r.turns.length - 1 ? `<div class="toolres"><div class="role">tool result (from the dataset)</div><pre>${esc(t.after)}</pre></div>` : ""}
+    </div>`).join("")}
+    ${stopped}`;
+}
+function matches(it) {
+  if (filter === "span" && !it.dlm) return false;
+  if (filter === "answer" && it.calls.length) return false;
+  if (filter === "wrong" && it.exact) return false;
+  if (query && !(it.label.toLowerCase().includes(query) || it.id.includes(query))) return false;
+  return true;
+}
+function renderList() {
+  if (view === "convs") return renderConvList();
+  shown = items.filter(matches);
+  const list = document.getElementById("list");
+  list.innerHTML = `<div class="count">${shown.length} of ${items.length} turns · most diffusion first</div>` +
+    shown.map((it, i) => `<div class="row" role="option" tabindex="0" data-i="${i}" aria-selected="${i === sel}">
+      <div class="row-h"><span class="fn">${esc(it.label)}</span><span class="pill ${it.exact ? "ok" : "no"}">${it.exact ? "match" : "miss"}</span></div>
+      ${strip(it)}
+      <div class="meta">${it.tokens} tokens · ${it.dlm} by diffusion · ${it.nfe} passes</div>
+    </div>`).join("");
+  if (sel >= shown.length) sel = 0;
+  renderDetail();
+}
+function renderDetail() {
+  if (view === "convs") return renderConvDetail();
+  const el = document.getElementById("detail");
+  const it = shown[sel];
+  if (!it) { el.innerHTML = '<div class="sub">No turns match this filter. Choose All or clear the search box.</div>'; return; }
+  const trace = traceHtml(it.segs);
+  const ctx = it.context.map(m => `<div class="role">${esc(m.role)}</div><pre>${esc(m.content)}</pre>`).join("");
+  const dp = it.dlm ? dlmPasses(it) : 0;
+  el.innerHTML = `
+    <div class="d-head"><span class="fn">${esc(it.label)}</span>
+      <span class="pill ${it.exact ? "ok" : "no"}">${it.exact ? "matches reference" : "differs from reference"}</span></div>
+    <div class="kv"><span><b>${it.tokens}</b> tokens</span><span><b>${it.nfe}</b> forward passes</span>
+      <span><b>${(it.tokens / it.nfe).toFixed(2)}</b> tokens / pass</span>
+      <span><b>${it.dlm}</b> diffusion tokens${it.dlm ? ` in <b>${dp}</b> passes (${(it.dlm / dp).toFixed(2)} / pass)` : ""}</span>
+      ${it.sec ? `<span><b>${it.sec}</b> s</span>` : ""}<span>reference: <b>${esc(it.ref_calls.join(", ") || "text answer")}</b></span></div>
+    ${strip(it, "big-strip")}
+    <details><summary>What the model is answering (last user / tool message)</summary>${ctx || '<pre>(start of conversation)</pre>'}</details>
+    <div><div class="label">Generated turn</div><pre class="trace">${trace}</pre></div>
+    <details><summary>Reference turn</summary><pre>${marks(esc(it.reference))}</pre></details>`;
+}
+document.getElementById("list").addEventListener("click", e => {
+  const r = e.target.closest(".row"); if (!r) return;
+  sel = +r.dataset.i; document.querySelectorAll(".row").forEach(x => x.setAttribute("aria-selected", x === r)); renderDetail();
+});
+document.getElementById("list").addEventListener("keydown", e => {
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Enter") return;
+  e.preventDefault();
+  if (e.key !== "Enter") sel = Math.max(0, Math.min(shown.length - 1, sel + (e.key === "ArrowDown" ? 1 : -1)));
+  else sel = +(e.target.dataset.i ?? sel);
+  document.querySelectorAll(".row").forEach((x, i) => x.setAttribute("aria-selected", i === sel));
+  const row = document.querySelector(`.row[data-i="${sel}"]`); row && row.focus(); renderDetail();
+});
+document.getElementById("chips").addEventListener("click", e => {
+  const c = e.target.closest(".chip"); if (!c) return;
+  filter = c.dataset.f; sel = 0; renderChips(); renderList();
+});
+document.querySelectorAll(".views button").forEach(b => b.addEventListener("click", () => {
+  view = b.dataset.v; filter = "all"; sel = 0;
+  document.querySelectorAll(".views button").forEach(x => x.setAttribute("aria-pressed", x === b));
+  renderChips(); renderList();
+}));
+renderChips();
+document.getElementById("q").addEventListener("input", e => { query = e.target.value.trim().toLowerCase(); sel = 0; renderList(); });
+renderList();
+</script>

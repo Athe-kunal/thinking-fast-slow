@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/arg_groups/overrides.py b/python/sglang/srt/arg_groups/overrides.py
-index 3d9a15552..f086211f2 100644
+index 3d9a15552..86c5306fe 100644
 --- a/python/sglang/srt/arg_groups/overrides.py
 +++ b/python/sglang/srt/arg_groups/overrides.py
 @@ -2138,7 +2138,8 @@ def _dllm_page_size(view: Any) -> dict:
@@ -7,8 +7,8 @@ index 3d9a15552..f086211f2 100644
      # needs page_size == 1; the generic block-size alignment below would
      # otherwise round it up to the dllm block size and corrupt the page table.
 -    if view.dllm_algorithm in ("LinearSpec", "linear_spec"):
-+    # RoutedDecoding commits partial blocks too (1 token per AR call).
-+    if view.dllm_algorithm in ("LinearSpec", "linear_spec", "RoutedDecoding"):
++    # RoutedDecoding and SpanDecoding commit partial blocks too (1 token per AR call).
++    if view.dllm_algorithm in ("LinearSpec", "linear_spec", "RoutedDecoding", "SpanDecoding"):
          if not view.disable_radix_cache and view.page_size != 1:
              logger.info("Setting page size to 1 for LinearSpec partial acceptance")
              return {"page_size": 1}
@@ -336,6 +336,252 @@ index 000000000..50eca3874
 +
 +
 +Algorithm = RoutedDecoding
+diff --git a/python/sglang/srt/dllm/algorithm/span.py b/python/sglang/srt/dllm/algorithm/span.py
+new file mode 100644
+index 000000000..61da74fef
+--- /dev/null
++++ b/python/sglang/srt/dllm/algorithm/span.py
+@@ -0,0 +1,240 @@
++"""Span decoding: the model's own <diff> token switches AR to block diffusion.
++
++Mirrors thinking-fast-slow's HF reference decoder `src/span_decode.py`:
++
++- Decoding is AR (one token per call) until the model commits `<diff>`.
++- Inside a span every call denoises one block (seed = AR argmax at position
++  0, the rest confidence-threshold unmasking over bidirectional passes) until
++  a `</diff>` is unmasked with no mask before it; the block is truncated after
++  that `</diff>` and decoding returns to AR.
++- Every call ends with one causal pass that persists the KV cache of the
++  committed tokens; the scheduler frees the rest (page size 1).
++
++Per-call costs (mode, committed tokens, forward passes) are appended to
++`<trace_dir>/<rid>.jsonl` when `trace_dir` is set.
++"""
++
++import collections
++import json
++import logging
++import os
++from typing import List, Optional
++
++import msgspec
++import numpy as np
++import torch
++
++from sglang.srt.dllm.algorithm.fastdiffuser import FastDiffuser
++from sglang.srt.dllm.config import DllmConfig
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++from sglang.srt.model_executor.model_runner import ModelRunner
++
++logger = logging.getLogger(__name__)
++
++_MAX_TRACKED_REQUESTS = 20000
++
++
++class _SpanState(msgspec.Struct):
++    """Per-request decoding state between scheduler calls."""
++
++    seed: int
++    in_span: bool = False
++    span_blocks: int = 0
++
++
++class SpanDecoding(FastDiffuser):
++    """AR outside <diff> spans, block diffusion inside them."""
++
++    def __init__(self, config: DllmConfig) -> None:
++        super().__init__(config)
++        cfg = config.algorithm_config
++        self.open_id: int = int(cfg.get("diff_open_id", 18))
++        self.close_id: int = int(cfg.get("diff_close_id", 19))
++        self.max_span_blocks: int = int(cfg.get("max_span_blocks", 64))
++        self.trace_dir: Optional[str] = cfg.get("trace_dir")
++        self._states: "collections.OrderedDict[str, _SpanState]" = (
++            collections.OrderedDict()
++        )
++        if self.trace_dir:
++            os.makedirs(self.trace_dir, exist_ok=True)
++        logger.info(
++            "SpanDecoding: block_size=%d threshold=%s open=%d close=%d trace_dir=%s",
++            self.block_size,
++            self.threshold,
++            self.open_id,
++            self.close_id,
++            self.trace_dir,
++        )
++
++    def run(
++        self,
++        model_runner: ModelRunner,
++        forward_batch: ForwardBatch,
++        algo_states=None,
++    ):
++        if not (forward_batch.input_ids == self.mask_id).any():
++            return self._prefill(model_runner=model_runner, forward_batch=forward_batch)
++
++        bs = forward_batch.dllm_block_size or self.block_size
++        rids = list(forward_batch.rids[: forward_batch.batch_size])
++        states = [self._states[r] for r in rids]
++        for b, s in enumerate(states):
++            forward_batch.input_ids[b * bs] = s.seed
++
++        steps = self._denoise(
++            model_runner=model_runner,
++            forward_batch=forward_batch,
++            dlm_idx=[b for b, s in enumerate(states) if s.in_span],
++            bs=bs,
++        )
++        out = self._causal_commit_pass(
++            model_runner=model_runner, forward_batch=forward_batch
++        )
++        next_token_ids = self._finish_call(
++            rids=rids,
++            states=states,
++            ids=forward_batch.input_ids,
++            full_logits=out.logits_output.full_logits,
++            steps=steps,
++            bs=bs,
++            eos_id=self._get_eos_id(model_runner),
++        )
++        return out.logits_output, next_token_ids, None, None, out.can_run_graph
++
++    # ------------------------------------------------------------- prefill
++    def _prefill(self, *, model_runner: ModelRunner, forward_batch: ForwardBatch):
++        """Prompt pass (no masks): stores each request's seed token."""
++        if forward_batch.input_ids.numel() == 0:
++            empty = LogitsProcessorOutput(next_token_logits=None, full_logits=None)
++            return empty, [], None, None, False
++        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++        next_logits = out.logits_output.next_token_logits
++        for b, rid in enumerate(forward_batch.rids[: forward_batch.batch_size]):
++            # Chunked prefill: the last chunk's seed overwrites earlier ones.
++            self._remember(rid=rid, state=_SpanState(seed=self._argmax_token(next_logits[b])))
++        return out.logits_output, [], None, None, out.can_run_graph
++
++    # ------------------------------------------------------------- denoise
++    def _needs_denoising(self, block: torch.Tensor) -> bool:
++        """True while a mask remains before the first </diff> (or anywhere)."""
++        masked = block == self.mask_id
++        close = (block == self.close_id).nonzero()
++        if len(close):
++            return bool(masked[: int(close[0])].any())
++        return bool(masked.any())
++
++    def _denoise(
++        self,
++        *,
++        model_runner: ModelRunner,
++        forward_batch: ForwardBatch,
++        dlm_idx: List[int],
++        bs: int,
++    ) -> List[int]:
++        """Fills span blocks; returns denoising passes per request."""
++        ids = forward_batch.input_ids
++        steps = [0] * forward_batch.batch_size
++        active = list(dlm_idx)
++        for _ in range(bs):
++            active = [b for b in active if self._needs_denoising(ids[b * bs : (b + 1) * bs])]
++            if not active:
++                break
++            fb = (
++                forward_batch
++                if len(active) == forward_batch.batch_size
++                else self._compact_forward_batch(forward_batch, active)
++            )
++            full = model_runner.forward(fb, pp_proxy_tensors=None).logits_output.full_logits
++            for i, b in enumerate(active):
++                steps[b] += 1
++                self._unmask_step(
++                    block=ids[b * bs : (b + 1) * bs], logits=full[i * bs : (i + 1) * bs]
++                )
++        return steps
++
++    def _unmask_step(self, *, block: torch.Tensor, logits: torch.Tensor) -> None:
++        """Commits the most confident mask plus all masks >= threshold."""
++        mask = block == self.mask_id
++        x0, conf = self._compute_confidence(logits, mask, block, torch.zeros_like(mask))
++        k = max(1, int((conf >= self.threshold).sum()))
++        k = min(k, int(mask.sum()))
++        _, top = torch.topk(conf, k=k)
++        block[top] = x0[top]
++
++    # ------------------------------------------------------------- commit
++    def _causal_commit_pass(
++        self, *, model_runner: ModelRunner, forward_batch: ForwardBatch
++    ):
++        """One causal pass over all blocks; persists KV."""
++        forward_batch.dllm_causal_kv_update = True
++        try:
++            return model_runner.forward(forward_batch, pp_proxy_tensors=None)
++        finally:
++            forward_batch.dllm_causal_kv_update = False
++
++    def _committed(self, *, block: torch.Tensor, in_span: bool) -> torch.Tensor:
++        """Tokens a call commits: 1 (AR) or the block up to the first </diff>."""
++        if not in_span:
++            return block[:1].clone()
++        close = (block == self.close_id).nonzero()
++        end = int(close[0]) + 1 if len(close) else block.numel()
++        return block[:end].clone()
++
++    def _finish_call(
++        self,
++        *,
++        rids: List[str],
++        states: List[_SpanState],
++        ids: torch.Tensor,
++        full_logits: torch.Tensor,
++        steps: List[int],
++        bs: int,
++        eos_id: Optional[int],
++    ) -> List[torch.Tensor]:
++        """Returns committed tokens and advances each request's state."""
++        next_token_ids = []
++        for b, (rid, s) in enumerate(zip(rids, states)):
++            tokens = self._committed(block=ids[b * bs : (b + 1) * bs], in_span=s.in_span)
++            finished = eos_id is not None and bool((tokens == eos_id).any())
++            if finished:
++                tokens = tokens[: int((tokens == eos_id).to(torch.int32).argmax()) + 1]
++            next_token_ids.append(tokens)
++            self._trace(
++                rid=rid,
++                record={"mode": "dlm" if s.in_span else "ar",
++                        "tokens": int(tokens.numel()), "nfe": steps[b] + 1},
++            )  # fmt: skip
++            if finished:
++                self._states.pop(rid, None)
++                continue
++            s.seed = self._argmax_token(full_logits[b * bs + tokens.numel() - 1])
++            if s.in_span:
++                s.span_blocks += 1
++                closed = int(tokens[-1]) == self.close_id
++                if closed or s.span_blocks >= self.max_span_blocks:
++                    s.in_span, s.span_blocks = False, 0
++            elif int(tokens[0]) == self.open_id:
++                s.in_span = True
++        return next_token_ids
++
++    # ------------------------------------------------------------- helpers
++    def _argmax_token(self, logits: torch.Tensor) -> int:
++        logits = logits.float().clone()
++        logits[self.mask_id] = -np.inf
++        return int(torch.argmax(logits))
++
++    def _remember(self, *, rid: str, state: _SpanState) -> None:
++        self._states[rid] = state
++        self._states.move_to_end(rid)
++        while len(self._states) > _MAX_TRACKED_REQUESTS:
++            self._states.popitem(last=False)
++
++    def _trace(self, *, rid: str, record: dict) -> None:
++        if not self.trace_dir:
++            return
++        with open(os.path.join(self.trace_dir, f"{rid}.jsonl"), "a") as f:
++            f.write(json.dumps(record) + "\n")
++
++
++Algorithm = SpanDecoding
 diff --git a/python/sglang/srt/models/nemotron_labs_dllm.py b/python/sglang/srt/models/nemotron_labs_dllm.py
 index 27ca2ae5b..a3d3041a7 100644
 --- a/python/sglang/srt/models/nemotron_labs_dllm.py

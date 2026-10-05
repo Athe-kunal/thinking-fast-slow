@@ -1486,6 +1486,27 @@ wheels = [
 ]
 
 [[package]]
+name = "peft"
+version = "0.21.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/80/af/2e08abf1cd3b8792a02f5116808f2398c2f77ecdff801ced2ce16007a6f9/peft-0.21.2.tar.gz", hash = "sha256:b803ccfb3f3f316004d850284306687833a2235ea278fb56abc856203456142e", size = 983614, upload-time = "2026-10-01T10:26:36.129Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/70/0b/59441cdbfdd342ed03c08af90a2fe16173f0cd48ab219f523b39ca059a79/peft-0.21.2-py3-none-any.whl", hash = "sha256:106ab6077ff72c54d21577f9af5970e34bac7582cb14209f7b2b511e322a4eae", size = 835427, upload-time = "2026-10-01T10:26:34.085Z" },
+]
+
+[[package]]
 name = "platformdirs"
 version = "4.12.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2166,6 +2187,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "mini-swe-agent" },
     { name = "nvitop" },
+    { name = "peft" },
     { name = "torch" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -2184,6 +2206,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.142.2" },
     { name = "mini-swe-agent", specifier = ">=2.4.6" },
     { name = "nvitop", specifier = ">=1.7.1" },
+    { name = "peft", specifier = ">=0.21.2" },
     { name = "torch", specifier = ">=2.6,<2.7", index = "https://download.pytorch.org/whl/cu124" },
     { name = "transformers", specifier = ">=5.0" },
     { name = "uvicorn", specifier = ">=0.54.0" },

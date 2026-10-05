@@ -1,0 +1,6 @@
+# E17 control: same data and budget, plain AR SFT (no spans, no diffusion
+# loss). Separates "fine-tuning on this data" from "the mixed loss".
+data: {diff_spans: false}
+eval:
+  settings: [ar]
+  workers_per_gpu: 6

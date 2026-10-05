@@ -1,0 +1,4 @@
+# Pipeline smoke test (minutes): tiny training + a few eval turns.
+data: {train_limit: 32}
+train: {batch: 4, warmup: 2, save_every: 4}
+eval: {settings: [spans, ar, base], limit: 6, workers_per_gpu: 2, max_new_tokens: 512}
