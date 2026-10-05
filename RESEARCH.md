@@ -284,26 +284,94 @@ outcome + compute cost, possibly with a supervised warm start), backbone frozen.
 - **Conclusion:** run2's router did not learn routing (weights barely moved; random-direction controls reproduce its behaviour; it50 vs it100 differ only in the first-decision constant). Its favourable HumanEval numbers come from always choosing AR first. Not significant vs comparable routers. Untested candidate rule suggested by this: AR for the first segment, then diffusion (or entropy routing) afterwards.
 - **RL takeaways:** std-normalized GRPO collapses to diffusion (E11); unnormalized advantages with entropy 0.05 does not move the policy at all (E12). Next attempts need a weaker entropy bonus (e.g. 0.01-0.02) or per-decision credit (e.g. reward-to-go / position-aware baselines), and evaluation should report first-decision behaviour separately.
 
-### E13. Router RL with a forced AR start (2026-10-04, running)
+### E13. Router RL with a forced AR start (2026-10-04)
 
 - **Question:** E12 showed the first segment's mode sets answer style and acts as a constant for a deterministic router. If the first 8 tokens are always AR, can RL learn the remaining AR/diffusion switching?
 - **Setup:** `runs/router_rl/run3_forcedar8`; as E12 (unnormalized advantages, 100 iterations x 32 prompts x 8 rollouts, 512 tokens, AR segment 8, diffusion block 32 / thr 0.9, cost weight 0.1, lr 3e-4, same data mix) except: `--forced-ar-tokens 8` (RoutedDecoding `forced_ar_tokens`: the router is not consulted and nothing is traced until 8 tokens are generated) and entropy bonus 0.01. Includes the code-review fixes. Eval: `learned:<ckpt>@ar8@first8` (HF `ForcedARStart` wrapper) on GSM8K test + HumanEval.
 - **Verified:** server trace for a forced-start request: 8 AR calls of 1 token, no decision record, first decision at token 8.
-- **Results:** pending.
+- **Training (100 iterations, 0 tracebacks):** small movement only: mean p(diffusion) 0.49 -> 0.55 over the run, policy entropy 0.674-0.692 (max 0.693), diffusion token share 0.76 -> 0.80, tokens/forward 1.75 -> 1.79.
+- **Eval (greedy decisions, `@ar8@first8`):**
+
+  | benchmark | router | accuracy | 95% CI | diffusion share | tokens/forward | length |
+  |---|---|---|---|---|---|---|
+  | HumanEval | E13 router | 73.2% | 65.9-79.4 | 86.5% | **3.11** | 209 |
+  | GSM8K | E13 router | 87.3% | 85.4-89.0 | 92.9% | 2.43 | 175 |
+
+  Paired McNemar: HumanEval vs AR 8 vs 20, **p=0.036** (worse); vs pure diffusion (block 32) 12 vs 11, p=1.0; vs random:0.8 15 vs 9, p=0.31. GSM8K vs AR 56 vs 57, p=1.0; vs pure diffusion p=1.0.
+- **Conclusion:** with the forced AR start, answers stay AR-length (209 tokens) and the router sends ~87% of tokens to diffusion, giving pure-diffusion accuracy on HumanEval at the highest efficiency seen (3.11 tokens/forward vs 2.46) and AR accuracy on GSM8K. Decisions after the start are state-dependent (second segment AR in 64% of HumanEval answers), but learning was small and no random-direction control was run, so how much is learned vs the forced start is open.
 
 ### E14. Entropy-bonus grid for router RL (2026-10-04, queued after E13)
 
 - **Question:** E11 (0.01 + std-normalized advantages) collapsed to diffusion; E12 (0.05, unnormalized) never moved. Where between does unnormalized-advantage RL learn?
 - **Setup:** three runs `runs/router_rl/grid_ent{0.005,0.01,0.02}`, identical to E12 (no forced AR start, unnormalized advantages) except the entropy bonus. Eval: `learned:<ckpt>@ar8`. `grid_ent0.01` differs from E13 only by the forced AR start.
-- **Results:** pending.
+- **Results:**
 
-### E15. Fine-grained routing: diffusion block 4, decision after every AR token (2026-10-04, running on GPUs 0+1)
+  | benchmark | entropy bonus | accuracy | 95% CI | diffusion share | tokens/forward | length |
+  |---|---|---|---|---|---|---|
+  | HumanEval | 0.005 | 72.0% | 64.6-78.3 | 88.5% | 2.09 | 415 |
+  | HumanEval | 0.01 | 71.3% | 64.0-77.7 | 93.2% | 2.31 | 410 |
+  | HumanEval | 0.02 | 71.3% | 64.0-77.7 | 83.2% | 2.84 | 208 |
+  | GSM8K | 0.005 | 87.3% | 85.4-89.0 | 95.4% | 2.51 | 172 |
+  | GSM8K | 0.01 | 87.9% | 86.1-89.6 | 95.3% | 2.54 | 173 |
+  | GSM8K | 0.02 | 87.1% | 85.2-88.8 | 91.5% | 2.40 | 174 |
+
+  Training p(diffusion) at the last iteration: 0.53 (0.005), 0.58 (0.01), 0.52 (0.02). The 0.005 and 0.01 routers take diffusion as the first decision on every answer (410-token explanation-first HumanEval answers); the 0.02 router takes AR first on every answer (208-token code-first answers, like E13's forced start). The first decision is a near-constant of the barely-trained policy, so which way it falls is essentially chance. Paired McNemar: HumanEval 0.005 vs AR p=0.009; 0.01 vs AR 25 vs 10 **p=0.017** (worse), vs pure diffusion (block 32) 8 vs 6 p=0.79; GSM8K 0.01 vs AR p=0.55, vs pure diffusion p=0.26. 0.02: HumanEval vs AR 20 vs 5 **p=0.004** (worse), vs pure diffusion 12 vs 14 p=0.85; GSM8K vs AR p=0.85, vs pure diffusion p=0.93. (The 0.02 eval was generated by the queue but never scored; scored by hand 2026-10-05.)
+- **Conclusion:** no entropy bonus in 0.005-0.02 yields a router better than pure diffusion; all three are at pure-diffusion accuracy on HumanEval (71-72%, significantly below AR) and at AR accuracy on GSM8K. Lower bonuses let the policy drift toward "more diffusion" (the cost term), not toward placing AR where it helps. The 0.02 run reaches E13-like efficiency (2.84 tokens/forward, short answers) only because its first decision happens to be AR. Sequence-level reward credited to all decisions does not teach where AR helps.
+
+### E15. Fine-grained routing: diffusion block 4, decision after every AR token (2026-10-04)
 
 - **Question:** E8/E9 found the costly mistakes happen inside long (32-token) diffusion blocks. With 4-token diffusion blocks and a router decision after every AR token, does a learned router get the control it needs?
 - **Setup:** (1) no-RL baselines at this granularity on GSM8K test + HumanEval: `random:1.0@ar1@blk4` (pure diffusion, block 4), `random:0.5@ar1@blk4`, `entropy:0.5@ar1@blk4` (pure AR is block-independent: reuse E5); (2) RL `runs/router_rl/run4_blk4_ar1`: as E12/E13 (unnormalized advantages, 100 x 32 x 8, 512 tokens, cost weight 0.1, lr 3e-4, same data) with `--block-size 4 --ar-chunk 1`, entropy bonus 0.01, no forced AR start; (3) eval `learned:<ckpt>@ar1@blk4`. Eval records in `runs/router_bench_e15/` (separate dir: the E13/E14 queue writes `runs/router_bench/` concurrently).
 - **New plumbing:** `@blk<n>` setting suffix (per-setting diffusion block length), `BLOCK_SIZE` for routed SGLang servers, trainer `--block-size`.
 - **SGLang parity at block 4 (GSM8K 5 + HumanEval 5, 256 tokens):** `fixed_dlm` vs HF `generate(block 4, thr 0.9)` identical 5/10 (others share 19-146 tokens); `fixed_ar` vs `ar_generate` identical 8/10.
-- **Results:** pending.
+- **Baselines (no RL; `runs/router_bench_e15/`):**
+
+  | benchmark | router | accuracy | 95% CI | diffusion share | tokens/forward | length |
+  |---|---|---|---|---|---|---|
+  | HumanEval | pure diffusion, block 4 | 78.0% | 71.1-83.7 | 100% | 1.74 | 211 |
+  | HumanEval | random 0.5, block 4 | 76.8% | 69.8-82.6 | 80% | 1.52 | 210 |
+  | GSM8K | pure diffusion, block 4 | 88.2% | 86.3-89.8 | 100% | 1.51 | 174 |
+  | GSM8K | random 0.5, block 4 | 87.8% | 85.9-89.5 | 80% | 1.37 | 177 |
+
+  Reference: AR HumanEval 80.5% / GSM8K 87.3% (1.00 tokens/forward); pure diffusion at block 32 HumanEval 72.6% (2.46 tokens/forward, 415-token answers). **Block size alone is a strong accuracy/efficiency knob:** block 4 diffusion is within 2.5 points of AR on HumanEval with AR-length answers, at 1.74 tokens/forward. (entropy:0.5 block-4 numbers: see final table.)
+- **RL attempt 1 crashed** at iteration 7 (`runs/router_rl/run4_blk4_ar1`): a sandbox container exited with status 1 (runner crash, not OOM), most likely a model output with a lone surrogate character that could not be written as UTF-8; one bad program killed the scoring batch and the trainer. Fixed in `scripts/rl_data.py`: files written with replacement characters, every per-program failure counts as a failed test, and a failing container is retried by bisection so only the offending program is marked wrong (tested: correct / surrogate / fork bomb / wrong -> True / True / False / False). The hand-written queue script also misreported the crash as "exit 0" (`$?` reset by `$(date)` in the echo); the config runner checks exit codes properly.
+- **RL relaunched** with the config runner (`configs/experiments/e15_blk4_ar1.yaml`, outputs `runs/experiments/e15_blk4_ar1/`; baseline records copied in so they are not recomputed).
+- **Training (100 iterations, ~45 s each):** the router did not move: mean p(diffusion) 0.49-0.53 per 20-iteration window, entropy 0.685-0.692; diffusion share ~0.80, tokens/forward ~1.33.
+- **Final table (all block 4, decision after every AR token):**
+
+  | benchmark | router | accuracy | 95% CI | diffusion share | tokens/forward | length |
+  |---|---|---|---|---|---|---|
+  | HumanEval | learned (E15) | 78.7% | 71.8-84.2 | 81.1% | 1.52 | 213 |
+  | HumanEval | pure diffusion | 78.0% | 71.1-83.7 | 100% | 1.74 | 211 |
+  | HumanEval | random 0.5 | 76.8% | 69.8-82.6 | 80.0% | 1.52 | 210 |
+  | HumanEval | entropy 0.5 | 73.8% | 66.6-79.9 | 98.7% | 1.74 | 216 |
+  | GSM8K | learned (E15) | 88.0% | 86.2-89.7 | 80.9% | 1.39 | 177 |
+  | GSM8K | pure diffusion | 88.2% | 86.3-89.8 | 100% | 1.51 | 174 |
+  | GSM8K | random 0.5 | 87.8% | 85.9-89.5 | 79.9% | 1.37 | 177 |
+  | GSM8K | entropy 0.5 | 88.8% | 87.0-90.4 | 95.7% | 1.50 | 173 |
+
+  Paired McNemar (learned vs): HumanEval AR 6 vs 9 p=0.61, pure diffusion 8 vs 7 p=1.0, random 0.5 8 vs 5 p=0.58, entropy 0.5 10 vs 2 **p=0.039**; GSM8K all p >= 0.34.
+- **Conclusion:** the learned router stayed at ~50/50 and behaves like random 0.5 routing. At block 4, pure diffusion is already within noise of AR on both benchmarks and is the most efficient option (1.74 / 1.51 tokens/forward), so routing adds nothing here; the gain comes from the smaller block itself. The entropy router is worse on HumanEval at this granularity (73.8%).
+
+### E16. Forced AR start + learned router with block-8 diffusion (2026-10-04, GPUs 0+1)
+
+- **Question:** combine the two things that worked: E13's forced AR start (short, code-first answers, highest efficiency) and smaller diffusion blocks (E15: better diffusion accuracy). Does a learned router on top beat pure diffusion / random routing under the same start and block size?
+- **Setup:** first runner-native experiment, `configs/experiments/e16_forced_ar8_blk8.yaml` -> `runs/experiments/e16_forced_ar8_blk8/`. As E13 (entropy bonus 0.01, unnormalized advantages, 100 x 32 x 8, cost weight 0.1) except diffusion block 8 (was 32); AR segment 8, forced AR tokens 8. Eval (greedy, `@ar8@blk8@first8`): learned, random:1.0 (pure diffusion), random:0.5. With equal 8-token AR segments and diffusion blocks, the diffusion token share ~ p(diffusion).
+- **Training (100 iterations, 0 failures):** p(diffusion) 0.53 -> 0.57, policy entropy ~0.675 (max 0.693); rollout diffusion share 0.51-0.55, tokens/forward 1.31-1.35.
+- **Results (all with forced 8-token AR start, AR segment 8, diffusion block 8):**
+
+  | benchmark | router | accuracy | 95% CI | diffusion share | tokens/forward | length |
+  |---|---|---|---|---|---|---|
+  | HumanEval | learned (E16) | 75.0% | 67.9-81.0 | 71.1% | 1.85 | 210 |
+  | HumanEval | pure diffusion | 75.6% | 68.5-81.5 | 96.1% | 2.58 | 207 |
+  | HumanEval | random 0.5 | 78.7% | 71.8-84.2 | 47.5% | 1.43 | 209 |
+  | GSM8K | learned (E16) | 88.7% | 86.9-90.3 | 83.6% | 1.78 | 174 |
+  | GSM8K | pure diffusion | 88.4% | 86.6-90.0 | 95.5% | 1.97 | 176 |
+  | GSM8K | random 0.5 | 88.5% | 86.6-90.1 | 47.5% | 1.32 | 177 |
+
+  Paired McNemar, HumanEval: learned vs AR 12 vs 3 **p=0.035** (worse); vs pure diffusion (block 8) 5 vs 6 p=1.0; vs random 0.5 4 vs 10 p=0.18; vs E13 learned (block 32) p=0.68. Pure diffusion block 8 vs AR p=0.096; random 0.5 vs AR 7 vs 4 p=0.55. GSM8K: learned vs AR 35 vs 53 p=0.069 (learned better, not significant); all other pairs p >= 0.08.
+- **Decision pattern (learned):** the router is task-dependent for the first time: the first routed segment (after the forced 8 AR tokens) is AR in 54% of HumanEval answers vs 12% of GSM8K answers, and it uses more AR on code (diffusion share 71% vs 84%), switching ~9 times per HumanEval answer.
+- **Conclusion:** the forced start keeps answers AR-length (~210 tokens) as in E13. The learned router again lands on the pure-diffusion accuracy/efficiency line: same accuracy as pure diffusion at block 8 but less efficient (1.85 vs 2.58 tokens/forward on HumanEval). Its extra AR on code is not placed where it helps; random 0.5 (more AR, uniformly placed) scores higher on HumanEval (n.s.). Block 8 pure diffusion with the forced start (75.6%, 2.58 tokens/forward) sits between block 32 (72.6%, 2.46, but long answers) and block 4 (78.0%, 1.74).
 
 ### Fixes after code review (2026-10-04)
 

@@ -188,30 +188,28 @@ RUNNER = r"""
 import concurrent.futures, json, pathlib, subprocess, sys
 jobs = json.loads(pathlib.Path("/work/jobs.json").read_text())
 def run(name):
-    job = jobs[name]
+    # Any failure (bad text, crash, timeout) counts as a failed test.
     try:
-        r = subprocess.run(job["cmd"], cwd=f"/tmp/{name}", capture_output=True,
+        d = pathlib.Path(f"/tmp/{name}"); d.mkdir()
+        for fname, src in jobs[name]["files"].items():
+            # Model output can contain lone surrogates; write replacements.
+            (d / fname).write_text(src, encoding="utf-8", errors="replace")
+        r = subprocess.run(jobs[name]["cmd"], cwd=d, capture_output=True,
                            timeout=10)
         return name, r.returncode == 0
-    except subprocess.TimeoutExpired:
+    except Exception:
         return name, False
-for name, job in jobs.items():
-    d = pathlib.Path(f"/tmp/{name}"); d.mkdir()
-    for fname, src in job["files"].items():
-        (d / fname).write_text(src)
 with concurrent.futures.ThreadPoolExecutor(8) as pool:
     print(json.dumps(dict(pool.map(run, jobs))))
 """
 
 
-def run_code_jobs(jobs: dict[str, dict]) -> dict[str, bool]:
-    """Runs all jobs in one network-less container; returns pass/fail."""
-    if not jobs:
-        return {}
+def _run_container(jobs: dict[str, dict]) -> dict[str, bool] | None:
+    """Runs jobs in one network-less container; None if the container fails."""
     with tempfile.TemporaryDirectory() as tmp:
         (pathlib.Path(tmp) / "jobs.json").write_text(json.dumps(jobs))
         (pathlib.Path(tmp) / "runner.py").write_text(RUNNER)
-        out = subprocess.run(
+        proc = subprocess.run(
             [
                 "docker", "run", "--rm", "--network", "none",
                 "--memory", "8g", "--cpus", "8", "--pids-limit", "1024",
@@ -220,9 +218,33 @@ def run_code_jobs(jobs: dict[str, dict]) -> dict[str, bool]:
             ],  # fmt: skip
             capture_output=True,
             text=True,
-            check=True,
-        ).stdout
-    return json.loads(out.strip().splitlines()[-1])
+            check=False,
+        )
+    lines = proc.stdout.strip().splitlines()
+    if proc.returncode != 0 or not lines:
+        return None
+    return json.loads(lines[-1])
+
+
+def run_code_jobs(jobs: dict[str, dict]) -> dict[str, bool]:
+    """Runs all jobs; returns pass/fail per job, never raises.
+
+    If a container fails as a whole (e.g. a program exhausts its memory or
+    process limit), the batch is split in half and retried, so only the
+    offending job is marked failed instead of the whole batch.
+    """
+    if not jobs:
+        return {}
+    result = _run_container(jobs)
+    if result is not None:
+        return result
+    if len(jobs) == 1:
+        return dict.fromkeys(jobs, False)
+    names = list(jobs)
+    half = len(names) // 2
+    out = run_code_jobs({n: jobs[n] for n in names[:half]})
+    out.update(run_code_jobs({n: jobs[n] for n in names[half:]}))
+    return out
 
 
 def score_batch(items: list[dict], texts: list[str]) -> list[bool]:

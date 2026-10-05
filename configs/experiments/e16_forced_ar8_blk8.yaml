@@ -1,0 +1,6 @@
+# E16: forced 8-token AR start, then the learned router with block-8 diffusion.
+# Same recipe as E13 except the diffusion block (32 -> 8).
+decoding: {forced_ar_tokens: 8, block_size: 8, ar_chunk: 8}
+train: {entropy_coef: 0.01}
+eval:
+  routers: [learned, random:1.0, random:0.5]
