@@ -22,6 +22,8 @@ from transformers import AutoTokenizer
 from scripts import sft_data
 from src import span_model, spans
 
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
 
 def main() -> None:
     """Command-line entry point."""
@@ -43,10 +45,14 @@ def main() -> None:
     )
     path = sft_data.build(d["shards"], d["max_len"], d["heldout_percent"])
     recs = sft_data.load(path, "train", d["train_limit"], t["seed"])
-    examples = [
-        spans.render(tok, r["messages"], r["tools"], d["diff_spans"])
-        for r in recs
-    ]
+    if d["span_labels"]:  # E18b: spans from scripts.label_spans
+        labeled = spans.load_labels(ROOT / d["span_labels"])
+        examples = [labeled[r["uuid"]] for r in recs]
+    else:
+        examples = [
+            spans.render(tok, r["messages"], r["tools"], d["diff_spans"])
+            for r in recs
+        ]
     print(f"{len(examples)} training conversations")
 
     model = span_model.load_base(span_model.DEFAULT_REPO, "cuda")

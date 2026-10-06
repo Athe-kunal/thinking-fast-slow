@@ -1,0 +1,10 @@
+# E18b: span SFT with spans from structure (tool calls, code, JSON, tables)
+# + masked-entropy blocks (list items entropy-gated) (tau 2.5 nats, first-pass argmax = data),
+# labeled by the E17 span model (scripts/label_spans.py). Same training budget
+# and evaluation as E17 (fresh LoRA from the base model).
+data:
+  span_labels: runs/sft_cache/labels_e18b_tau2.5_listgated.jsonl
+loss: {block_size: 8, ar_in_spans: true}
+eval:
+  settings: [spans, ar]
+  workers_per_gpu: 6

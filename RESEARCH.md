@@ -408,6 +408,25 @@ outcome + compute cost, possibly with a supervised warm start), backbone frozen.
 - **Viewer:** `scripts/build_trace_viewer.py` builds a local page (`runs/sft/e17_span_sft/trace_viewer.html`) with single turns and full rollouts; AR text plain, diffusion blocks highlighted.
 - **Artifacts:** `runs/sft/e17_span_sft/` (adapter `train/adapter_final.pt`: LoRA + span rows only, 189 MB per checkpoint; `eval/generations.jsonl`, `eval/summary.json`), `runs/sft/e17_ar_sft_control/`, `runs/sft/e17_base/`.
 
+### E18a. Where could diffusion take over? Diffusability pilot (2026-10-05)
+
+- **Question:** E17 spans come from the data format (tool calls, ~4-6% of assistant tokens). Which other parts of a turn can the model's own block diffusion reproduce cheaply, and do entropy signals predict them?
+- **Setup:** 25 held-out turns (8,717 generated tokens), the E17 span-SFT model's own AR outputs (setting `ar`) as target text. For every token position s, simulate the span decoder: KV cache = true prefix, block position 0 seeded with the AR token, 7 masked positions filled by threshold-0.9 unmasking (`src/diffusability.py`; all candidate blocks of a turn denoised together with the span-SFT layout, one forward per iteration). Checked against the real decoder on 30 random blocks: 29/30 identical tokens, 27/30 identical pass counts. A block is "good" if it reproduces the AR tokens exactly within <= 2-3 denoising passes; good blocks are tiled greedily into spans (>= 1 or >= 2 blocks; every span is >= 8 tokens). Predicted cost: 1 AR pass for `<diff>`, denoising passes + 1 commit pass per block, 1 pass per AR token. `scripts/diffusability_pilot.py`, `scripts/diffusability_report.py`; outputs `runs/sft/e17_span_sft/diffusability/` (`pilot.json`, `annotated.md`).
+- **Results:** 56.6% of the 8,542 candidate blocks are reproduced exactly, but only 21.3% within <= 3 passes (exact blocks by passes: 1: 883, 2: 451, 3: 487, ..., 7: 1,114; slow exact blocks give no speedup).
+
+  | rule | spans | thinking covered | answer covered | calls covered | predicted tokens/pass |
+  |---|---|---|---|---|---|
+  | <= 2 passes, >= 1 block | 148 | 13% | 25% | 80% | 1.16 |
+  | <= 2 passes, >= 2 blocks | 50 | 4% | 19% | 74% | 1.11 |
+  | <= 3 passes, >= 1 block | 184 | 20% | 34% | 88% | 1.19 |
+  | <= 3 passes, >= 2 blocks | 72 | 11% | 25% | 86% | 1.15 |
+
+  By structure (share of tokens; good blocks <= 3 passes; exact in 1 pass): prose in thinking 62% / 11% / 3%; prose in final answers 16% / 12% / 4%; markdown list items 12% / 44% / 28%; tool calls 10% / 78% / 52%; JSON 0.1% / 50% / 17%. No code blocks or tables in these turns.
+- **What the spans are:** copied facts (coordinates, prices, names), function names and arguments, formulaic phrases (" see. The user is looking for a", "**Subject:**"), list scaffolding; reasoning steps almost never. The labeler independently marks 80-88% of tool-call tokens, a sanity check.
+- **Near misses** (6-7 of 8 tokens right) are mostly paraphrases ("I should call" vs "I'll call", "more information" vs "more details"), sometimes errors ("inspire mente"): exact match is too strict for free text.
+- **Entropy:** separating good from bad blocks (AUC, lower = good): first-pass masked entropy 0.959, AR entropy summed over the block 0.973 (the latter needs the block's tokens, so it is not available before decoding; masked entropy is, after the first draft pass).
+- **Conclusion / next (E18b):** diffusion is reliable on systematic text (tool calls, list items, JSON; code blocks and tables expected, not present here) and rarely on prose. Label spans by structure (always diffusion: tool calls, code blocks, JSON, tables, list items; ~22% of tokens here vs ~4-6% in E17) plus measured prose blocks, ideally with an "AR-plausible" criterion (diffusion block's AR log-likelihood close to AR's own) so paraphrases count; spans >= 1 block. The predicted tokens/pass here (1.15-1.19) is for the untrained model; span SFT on these labels should cut passes.
+
 ### Fixes after code review (2026-10-04)
 
 Applied before any further router training (E13 onward); E11/E12 ran without them.
@@ -428,6 +447,11 @@ Verified with a 2-iteration run + resume to iteration 3 at a 64-token limit: 48 
 - **LearnedSampler** (staged SGLang branch, unmerged, no public checkpoint): small transformer scoring which masked tokens to commit inside diffusion; inputs are top-k probs/entropy/token features, not the backbone hidden state.
 - **S2D2** (arXiv 2603.25702): training-free self-speculation for block diffusion; routing policies decide when to verify (min-span, score-threshold, hysteresis, UCB bandit); bandit was not the best policy; entropy-based estimator gave the best accuracy. Tested on SDAR, Fast-dLLM v2, LLaDA2.1, not Nemotron.
 - **SDAR:** AR-initialised block-diffusion model; single decoding mode, fixed block per checkpoint; no inference-time switching.
+- **Looped Diffusion Language Models / LoopMDM** (arXiv 2605.26106, KAIST/KRAFTON/UC Berkeley, 2026-05): masked-diffusion transformer split into head / looped mid-block / tail; a few early-to-middle layers looped S times (S ~ U{1..S_max} in training). Matches non-looped NLL with up to 3.3x fewer training FLOPs; GSM8K up to +8.5 over same size and above a deeper iso-per-step-FLOP baseline. Loop gains peak at intermediate denoising timesteps and with few denoising steps; mask-to-mask attention grows with loops (masks as a parallel workspace); stopping when the hidden-state change falls below a threshold cuts loops 12 -> ~5. 125-170M models trained from scratch. Relevance: cheaper per-pass refinement inside our spans (we pay a full pass per ~3 span tokens).
+- **Recursive Masked Diffusion Models / R-MDM** (arXiv 2606.18022, EPFL/Cambridge, 2026-06): whole denoiser looped L times per denoising step, logits supervised after every loop, loop-index embedding, reverse curriculum on L. Loops substitute for denoising steps (Sudoku: 3 loops x 5 steps = baseline at 40 steps, 2.7x fewer passes) and for parameters on structured tasks (Sudoku, Countdown); worse than the baseline on character-level text (Text8). <= ~50M parameters.
+- **Looped Diffusion Transformer** (arXiv 2609.40305, 2026-09): looping for text-to-image diffusion; not language.
+- **LaDiR** (arXiv 2510.04573, UCSD/Apple, ICLR 2026): latent diffusion for reasoning. A VAE encodes each CoT sentence into a block of continuous latent tokens (~4 latents per ~22 text tokens); the LLM backbone denoises latent blocks with flow matching (bidirectional within a block, causal across blocks), predicts continue-thinking vs start-answer, then writes the answer AR. Teacher-forced training, then rollout training that backpropagates answer loss into generated latents; diversity guidance at inference. Better pass@1 and much better pass@100 on math/code; ~AR latency at 10 denoising steps. Relevance: same block-causal structure as our spans, but denoises compressed continuous thoughts instead of masked tokens (speed from compression rather than parallel decoding). Follow-ups: LaDi-RL (2602.01705), Uni-LaDiR (2609.19878).
+- **None of the looping work retrofits looping onto a pretrained multi-billion-parameter diffusion LM**; doing so for Nemotron 3B would need real training (not LoRA), and R-MDM's text result is negative.
 
 ## 7. Open questions and next steps
 

@@ -146,6 +146,91 @@ def render(tokenizer, messages: list, tools: list, diff_spans: bool) -> Example:
 
 
 @dataclasses.dataclass
+class PlainRender:
+    """A conversation tokenized without span markers.
+
+    Attributes:
+        text: Chat-template text.
+        ids: Token ids (markers spelled as text, no <diff> tokens).
+        assistant: 1 for tokens of assistant turns.
+        offsets: (start, end) character range of each token in `text`.
+        calls: [start, end) token ranges of `<tool_call> ... </tool_call>`.
+    """
+
+    text: str
+    ids: list[int]
+    assistant: list[int]
+    offsets: list[tuple[int, int]]
+    calls: list[tuple[int, int]]
+
+
+def render_plain(tokenizer, messages: list, tools: list) -> PlainRender:
+    """Like `render(..., diff_spans=False)`, also returning offsets and calls.
+
+    Token ids are identical to `render(..., diff_spans=False)`: the same
+    segments are tokenized separately.
+    """
+    text = tokenizer.apply_chat_template(messages, tools=tools, tokenize=False)
+    segments = []  # (start, end, assistant, call)
+    pos = 0
+    for m in _ASSISTANT.finditer(text):
+        a, b = m.span(1)
+        segments.append((pos, a, 0, 0))
+        cur = a
+        for c in _TOOL_CALL.finditer(text, a, b):
+            segments += [(cur, c.start(), 1, 0), (c.start(), c.end(), 1, 1)]
+            cur = c.end()
+        segments.append((cur, b, 1, 0))
+        pos = b
+    segments.append((pos, len(text), 0, 0))
+    plain = plain_tokenizer(tokenizer)
+    ids, assistant, offsets, calls = [], [], [], []
+    for start, end, asst, call in segments:
+        if start == end:
+            continue
+        enc = plain.encode(text[start:end], add_special_tokens=False)
+        if call:
+            calls.append((len(ids), len(ids) + len(enc.ids)))
+        ids += enc.ids
+        assistant += [asst] * len(enc.ids)
+        offsets += [(start + a, start + b) for a, b in enc.offsets]
+    return PlainRender(text, ids, assistant, offsets, calls)
+
+
+def with_spans(
+    ids: list[int], assistant: list[int], ranges: list[tuple[int, int]]
+) -> Example:
+    """Wraps token ranges [a, b) as `<diff> ... </diff>` (sorted, disjoint)."""
+    out, asst, span = [], [], []
+    starts = {a: b for a, b in ranges}
+    ends = {b for _, b in ranges}
+    inside = False
+    for i, (t, a) in enumerate(zip(ids, assistant, strict=True)):
+        if i in ends and inside:
+            out.append(DIFF_CLOSE), asst.append(1), span.append(1)
+            inside = False
+        if i in starts:
+            out.append(DIFF_OPEN), asst.append(1), span.append(0)
+            inside = True
+        out.append(t), asst.append(a), span.append(int(inside))
+    if inside:
+        out.append(DIFF_CLOSE), asst.append(1), span.append(1)
+    return Example(out, asst, span)
+
+
+def load_labels(path) -> dict:
+    """uuid -> Example from a span-label file (scripts.label_spans)."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            out[r["uuid"]] = with_spans(
+                r["ids"], r["assistant"], [tuple(x) for x in r["spans"]]
+            )
+    return out
+
+
+@dataclasses.dataclass
 class Layout:
     """Tensors for one training forward pass (batch size 1).
 

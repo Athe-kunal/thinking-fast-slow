@@ -37,6 +37,8 @@ DEFAULTS: dict = {
         "heldout_percent": 5,
         "train_limit": 8000,  # training conversations
         "diff_spans": True,  # wrap tool calls in <diff> ... </diff>
+        # Span-label file (scripts.label_spans); overrides diff_spans.
+        "span_labels": None,
     },
     "loss": {
         "block_size": 8,  # diffusion block inside spans
@@ -112,7 +114,9 @@ def run_one(run: dict, gpus: list, dry: bool) -> None:
                "--threshold", str(e["threshold"])]  # fmt: skip
         if setting != "base":
             cmd += ["--adapter", str(adapter)]
-            if run["data"]["diff_spans"]:
+            if run["data"]["span_labels"]:
+                cmd += ["--span-labels", str(ROOT / run["data"]["span_labels"])]
+            elif run["data"]["diff_spans"]:
                 cmd.append("--diff-spans")
         if e["limit"] is not None:
             cmd += ["--limit", str(e["limit"])]

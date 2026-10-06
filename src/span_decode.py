@@ -11,6 +11,8 @@ With `mode="ar"` every token is decoded AR (spans included), the reference
 for what the same weights produce without diffusion.
 """
 
+from collections.abc import Callable
+
 import torch
 
 from src import spans
@@ -31,6 +33,7 @@ def span_generate(
     threshold: float = 0.9,
     mode: str = "spans",
     seed_ar: bool = True,
+    on_event: Callable[[dict], None] | None = None,
 ) -> InterleavedOutput:
     """Greedy span-switched generation (batch size 1).
 
@@ -43,6 +46,11 @@ def span_generate(
         threshold: Diffusion confidence threshold for unmasking.
         mode: "spans" (diffusion inside <diff> spans) or "ar" (all AR).
         seed_ar: Seed each diffusion block's first token with the AR argmax.
+        on_event: Optional callback for streaming / visualization, called
+            with {"type": "ar", "token"}, {"type": "block", "tokens"} (a
+            diffusion block after seeding and after every denoising pass,
+            masks included), {"type": "commit", "tokens"} (the kept block);
+            every event carries the running forward-pass count "nfe".
 
     Returns:
         Tokens, forward passes and the AR / diffusion segments.
@@ -61,6 +69,10 @@ def span_generate(
     nfe = 1
     tokens: list[int] = []
     segments: list[Segment] = []
+
+    def emit(kind: str, **kw) -> None:
+        if on_event is not None:
+            on_event({"type": kind, "nfe": nfe, **kw})
 
     def add(mode_: str, n: int) -> None:
         if segments and segments[-1].mode == mode_:
@@ -85,6 +97,7 @@ def span_generate(
         token = int(_argmax(next_logit))
         tokens.append(token)
         add("ar", 1)
+        emit("ar", token=token)
         if token == eos_token_id:
             break
         commit(torch.tensor([[token]], device=device))
@@ -102,6 +115,7 @@ def span_generate(
                 block[:, 0] = _argmax(next_logit)[:, 0]
             _set_causal(model, False)
             close = None
+            emit("block", tokens=block[0].tolist(), mask_id=mask_id)
             while True:
                 masked = block == mask_id
                 hits = (block[0] == spans.DIFF_CLOSE).nonzero()
@@ -120,16 +134,19 @@ def span_generate(
                     num_transfer_tokens=num_transfer[:, 0], threshold=threshold,
                 )  # fmt: skip
                 block = torch.where(transfer, x0, block)
+                emit("block", tokens=block[0].tolist(), mask_id=mask_id)
             keep = block[:, : close + 1] if close is not None else block
             new = keep[0].tolist()
             if eos_token_id in new:
                 new = new[: new.index(eos_token_id) + 1]
                 tokens.extend(new)
                 add("dlm", len(new))
+                emit("commit", tokens=new)
                 return InterleavedOutput(tokens, nfe, segments)
             tokens.extend(new)
             add("dlm", len(new))
             commit(keep)
+            emit("commit", tokens=new)
             if close is not None:
                 break
     _set_causal(model, True)

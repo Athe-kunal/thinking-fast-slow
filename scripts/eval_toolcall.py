@@ -50,14 +50,24 @@ def parse_calls(text: str) -> tuple[list, bool]:
     return sorted(calls), ok
 
 
-def items(limit: int | None, diff_spans: bool, tok) -> list[dict]:
-    """Prompt / reference pairs for the held-out split."""
+def items(
+    limit: int | None, diff_spans: bool, tok, span_labels: str | None = None
+) -> list[dict]:
+    """Prompt / reference pairs for the held-out split.
+
+    With `span_labels` (scripts.label_spans output) conversations are
+    rendered with those spans, as in E18b training.
+    """
     from src import spans
 
     path = sft_data.cache_path([0], 4096)
+    labeled = spans.load_labels(span_labels) if span_labels else None
     out = []
     for rec in sft_data.load(path, "heldout", None, 0):
-        ex = spans.render(tok, rec["messages"], rec["tools"], diff_spans)
+        if labeled is not None:
+            ex = labeled[rec["uuid"]]
+        else:
+            ex = spans.render(tok, rec["messages"], rec["tools"], diff_spans)
         starts = [
             i
             for i in range(len(ex.ids))
@@ -185,6 +195,7 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, default=8)
     parser.add_argument("--threshold", type=float, default=0.9)
     parser.add_argument("--score-only", action="store_true")
+    parser.add_argument("--span-labels", default=None, help="E18b label file for prompts")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     gen_file = args.out / "generations.jsonl"
@@ -205,7 +216,7 @@ def main() -> None:
             }
         todo = [
             it
-            for it in items(args.limit, args.diff_spans, tok)
+            for it in items(args.limit, args.diff_spans, tok, args.span_labels)
             if (it["id"], args.setting) not in done
         ]
         slots = [g for g in args.gpus for _ in range(args.workers_per_gpu)]
