@@ -427,6 +427,24 @@ outcome + compute cost, possibly with a supervised warm start), backbone frozen.
 - **Entropy:** separating good from bad blocks (AUC, lower = good): first-pass masked entropy 0.959, AR entropy summed over the block 0.973 (the latter needs the block's tokens, so it is not available before decoding; masked entropy is, after the first draft pass).
 - **Conclusion / next (E18b):** diffusion is reliable on systematic text (tool calls, list items, JSON; code blocks and tables expected, not present here) and rarely on prose. Label spans by structure (always diffusion: tool calls, code blocks, JSON, tables, list items; ~22% of tokens here vs ~4-6% in E17) plus measured prose blocks, ideally with an "AR-plausible" criterion (diffusion block's AR log-likelihood close to AR's own) so paraphrases count; spans >= 1 block. The predicted tokens/pass here (1.15-1.19) is for the untrained model; span SFT on these labels should cut passes.
 
+### E18b. Span SFT with structure + entropy spans (2026-10-05/06)
+
+- **Question:** E17 spans covered only tool calls (~5% of tokens). If spans also cover structured text and low-entropy stretches of prose, does the model learn to switch there, and what happens to accuracy and speed?
+- **Labels (`scripts/label_spans.py`, `runs/sft_cache/labels_e18b_tau2.5_listgated.jsonl`):** labeled by the E17 span model on the dataset text (same 8,000 train + 730 held-out conversations as E17). (1) Structure, always diffusion: tool calls, fenced code blocks, markdown tables, JSON objects (each >= 8 tokens). (2) Elsewhere, 8-token blocks whose first diffusion pass (seed = dataset token, 7 positions masked against the true prefix) has summed masked entropy < 2.5 nats and argmax = dataset token at every masked position; consecutive good blocks form one span; spans >= 1 block; never the turn-final `<|im_end|>`. A first version also made every markdown list item a span (answers 56% covered); inspection showed many list items are free prose (pilot: only 44% of list blocks diffusable), so list items were made entropy-gated like other text (option 2, user's choice). Labeling batched across conversations (one forward scores every candidate block of up to ~32 conversations), sharded over GPUs 2 + 3, ~50 min.
+- **Coverage:** tool calls 100%, final answers 23%, thinking 7%, overall ~19% of assistant tokens (E17 ~5%); ~131k spans: ~115k entropy spans (copied facts, names, URLs, numbers, formulaic text), ~17k tool calls, ~1.9k code / tables / JSON.
+- **Training:** as E17 (fresh LoRA r=32 on the base model + span rows, 500 steps x 16 conversations, ar_in_spans), labels via `data.span_labels` (`configs/sft/e18b_entropy_spans.yaml`), GPU 2, ~20 s/step (4x more noisy tokens than E17). Final AR loss ~0.72, diffusion CE on masked span tokens ~0.25.
+- **Results (730 held-out turns, HF decoder):**
+
+  | model / decoding | exact | 95% CI | exact on call turns | decision | diffusion share | tokens/forward | length |
+  |---|---|---|---|---|---|---|---|
+  | E17 span SFT, spans | 74.9% | 71.7-77.9 | 59.4% | 87.4% | 5.3% | 1.04 | 504 |
+  | **E18b, spans** | 75.1% | 71.8-78.1 | 60.4% | 88.5% | **13.2%** | **1.09** | 460 |
+  | E18b, all AR | 74.9% | 71.7-77.9 | 60.4% | 88.2% | 0% | 1.00 | 467 |
+
+  Paired McNemar: E18b spans vs E18b AR 16 vs 17, p=1.0; vs E17 spans 37 vs 38, p=1.0 (call turns 24 vs 28, p=0.68).
+- **The model switches outside tool calls:** 1,739 spans emitted on 730 turns (2.4 per turn): 424 tool calls, 787 in thinking, 528 in final answers. Emitted non-call spans are the intended kind: product names and prices in lists, phone numbers, identifiers ("`national_gallery_hudson_river_school_walkthrough_reel`"), quoted titles, base64 strings. Inside spans 2.81 tokens per forward pass (44,299 tokens / 15,791 passes; E17 rollouts 3.06).
+- **Conclusion:** structure + entropy labels teach the model to open spans wherever it is copying or writing predictable text, with no accuracy cost: diffusion share 2.5x E17 (13.2% vs 5.3%), whole-turn tokens/forward 1.09 vs 1.04. The bound is the labels (~19% of tokens); thinking stays ~93% AR. HF wall-clock tokens/s is not comparable across these runs (eager, 6 workers per GPU, different GPUs).
+
 ### Fixes after code review (2026-10-04)
 
 Applied before any further router training (E13 onward); E11/E12 ran without them.
